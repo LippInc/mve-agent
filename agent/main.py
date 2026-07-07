@@ -52,8 +52,18 @@ def read_tasks(path: str) -> list:
     for i, t in enumerate(data):
         if not isinstance(t, dict):
             continue
-        tid = t.get("task_id") or t.get("id") or f"task-{i + 1}"
-        prompt = t.get("prompt") or t.get("question") or t.get("input") or ""
+        tid = t.get("task_id")
+        if tid is None:
+            tid = t.get("id")
+        if tid is None:
+            tid = f"task-{i + 1}"
+        prompt = t.get("prompt")
+        if prompt is None:
+            prompt = t.get("question")
+        if prompt is None:
+            prompt = t.get("input")
+        if prompt is None:
+            prompt = ""
         tasks.append({"task_id": str(tid), "prompt": str(prompt)})
     return tasks
 
@@ -66,11 +76,11 @@ def atomic_write_results(results_in_order: list) -> bool:
         tmp = os.path.join(OUTPUT_DIR, ".results.tmp")
         final = os.path.join(OUTPUT_DIR, "results.json")
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(results_in_order, f, ensure_ascii=False)
+            json.dump(results_in_order, f, ensure_ascii=False, allow_nan=False)
         os.replace(tmp, final)
         return True
-    except OSError as e:
-        log(f"[output-error] {type(e).__name__}: {e}")
+    except Exception as e:  # any write failure must not crash the exit-0 rail
+        log(f"[output-error] {type(e).__name__}")
         return False
 
 
@@ -84,7 +94,13 @@ def main() -> int:
     # Insurance first: a complete, valid results file exists before any
     # network call is attempted.
     answers = {t["task_id"]: FALLBACK_ANSWER for t in tasks}
-    order = [t["task_id"] for t in tasks]
+    order = []
+    _seen = set()
+    for t in tasks:
+        tid = t["task_id"]
+        if tid not in _seen:
+            _seen.add(tid)
+            order.append(tid)
 
     def results_list():
         return [{"task_id": tid, "answer": answers[tid]} for tid in order]
@@ -95,10 +111,16 @@ def main() -> int:
     ladder = []
     if settings.online:
         # Deferred import keeps boot instant even if httpx grows deps later.
-        from agent.fw import FireworksClient
-        from agent import pipelines
-        client = FireworksClient(settings)
-        ladder = list(settings.models)
+        # Guarded so a broken import/init can never defeat the exit-0 rail:
+        # on any failure we ship the fallback answers already on disk.
+        try:
+            from agent.fw import FireworksClient
+            from agent import pipelines
+            client = FireworksClient(settings)
+            ladder = list(settings.models)
+        except Exception as e:
+            client = None
+            log(f"[init-error] {type(e).__name__} - shipping fallback answers")
     else:
         log("[offline] missing env config - shipping fallback answers")
 
@@ -122,7 +144,7 @@ def main() -> int:
             if ans:
                 answers[t["task_id"]] = str(ans)
         except Exception as e:  # per-task isolation: one bad task never kills the run
-            log(f"[task-error] {t['task_id']} {type(e).__name__}: {e}")
+            log(f"[task-error] {t['task_id']} {type(e).__name__}")
         atomic_write_results(results_list())
 
     wrote = atomic_write_results(results_list()) or wrote

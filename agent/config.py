@@ -41,6 +41,18 @@ def _last_segment(model_id: str) -> str:
     return model_id.rstrip("/").rsplit("/", 1)[-1].strip().lower()
 
 
+def _to_callable(model_id: str) -> str:
+    """Fireworks expects the full 'accounts/fireworks/models/<name>' path.
+    ALLOWED_MODELS may arrive as bare names or full account paths; normalize
+    bare names to the full path and pass anything already containing an
+    account path through untouched. fw.py toggles the two forms at call time
+    if this guess 404s, so we are robust to whichever the graded proxy wants."""
+    m = model_id.strip().rstrip("/")
+    if "/" in m:
+        return m
+    return f"accounts/fireworks/models/{m}"
+
+
 def resolve_models(allowed_raw: str) -> list:
     """Map ALLOWED_MODELS (comma-separated; bare ids or full account paths)
     onto MODEL_PREFERENCE via suffix match. Returns the allowed entries
@@ -53,7 +65,7 @@ def resolve_models(allowed_raw: str) -> list:
     ladder = [by_suffix[p.lower()] for p in MODEL_PREFERENCE if p.lower() in by_suffix]
     known = set(ladder)
     ladder += [e for e in entries if e not in known]
-    return ladder
+    return [_to_callable(m) for m in ladder]
 
 
 class Settings:

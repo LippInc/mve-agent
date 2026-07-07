@@ -9,10 +9,8 @@ fireworks.
 ## docker image
 
 ```
-ghcr.io/OWNER/mve-agent:latest
+ghcr.io/lippinc/mve-agent:latest
 ```
-
-(placeholder — replaced at first push)
 
 ## how it runs
 
@@ -23,7 +21,7 @@ docker run --rm \
   -e FIREWORKS_API_KEY=... \
   -e FIREWORKS_BASE_URL=... \
   -e ALLOWED_MODELS=... \
-  ghcr.io/OWNER/mve-agent:latest
+  ghcr.io/lippinc/mve-agent:latest
 ```
 
 all configuration comes from the environment. all inference goes through
@@ -32,5 +30,4 @@ no other network calls.
 
 ## submission items
 
-- demo video: (link)
-- slide deck: (link)
+demo video and slide deck accompany the lablab submission.

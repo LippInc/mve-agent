@@ -36,16 +36,26 @@ class CallResult:
 _STRIPPABLE = ("thinking", "response_format", "stop", "reasoning_effort")
 
 
+def _alternate_model_form(model_id: str) -> str:
+    """Toggle between the bare name and the full Fireworks account path, so a
+    model-not-found can be retried in the form the graded proxy expects."""
+    m = model_id.strip().rstrip("/")
+    if "/" in m:
+        return m.rsplit("/", 1)[-1]
+    return f"accounts/fireworks/models/{m}"
+
+
 class FireworksClient:
     def __init__(self, settings):
         self.s = settings
-        self.http = httpx.Client(timeout=httpx.Timeout(25.0, connect=5.0))
+        self.http = httpx.Client(timeout=httpx.Timeout(22.0, connect=4.0))
         self.ledger = {
             "calls": 0, "retries": 0, "errors": 0,
             "prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0,
         }
         self.leak_strikes = {}   # model id -> strike count
         self.dead_models = set()
+        self.model_form = {}     # ladder id -> the id form that actually worked
 
     def leak_suspect(self, model: str) -> bool:
         return self.leak_strikes.get(model, 0) >= 2
@@ -56,7 +66,7 @@ class FireworksClient:
         Retries transient failures with backoff while time remains; strips
         optional params once on a 400 that names them."""
         body = {
-            "model": model,
+            "model": self.model_form.get(model, model),
             "messages": messages,
             "max_tokens": max_tokens,
             "temperature": temperature,
@@ -68,44 +78,63 @@ class FireworksClient:
         if response_format:
             body["response_format"] = response_format
 
-        attempt = 0
+        attempt = 0        # counts transient retries only (bounds the loop)
         stripped = False
+        tried_alt = False
         while True:
             remaining = deadline - time.monotonic()
             if remaining < 1.5 or attempt >= 4:
                 return CallResult()
-            attempt += 1
             t0 = time.monotonic()
             try:
                 r = self.http.post(
                     f"{self.s.base_url}/chat/completions",
                     headers={"Authorization": f"Bearer {self.s.api_key}"},
                     json=body,
+                    # connect + read are additive; keep the sum < 30 s/request
                     timeout=httpx.Timeout(
-                        max(1.0, min(remaining - 0.5, 25.0)),
-                        connect=max(1.0, min(5.0, remaining - 0.5)),
+                        min(remaining - 0.5, 22.0),
+                        connect=min(4.0, remaining - 0.5),
                     ),
                 )
             except httpx.HTTPError as e:
+                attempt += 1
                 self.ledger["errors"] += 1
+                self.ledger["retries"] += 1
                 log(f"[call-error] model={model} attempt={attempt} {type(e).__name__}")
                 self._backoff(attempt, deadline)
-                self.ledger["retries"] += 1
                 continue
 
             elapsed = time.monotonic() - t0
             if r.status_code == 200:
+                if body["model"] != model:
+                    self.model_form[model] = body["model"]
                 return self._handle_200(r, model, elapsed)
             if r.status_code in (400, 404, 422):
-                text = r.text[:500]
-                if not stripped and any(k in body for k in _STRIPPABLE) \
-                        and any(k in text for k in _STRIPPABLE):
-                    for k in _STRIPPABLE:
-                        body.pop(k, None)
-                    stripped = True
-                    log(f"[param-strip] model={model} http={r.status_code}")
-                    continue
-                if "model" in text.lower():
+                tl = r.text[:500].lower()
+                # 1) Strip only the optional param the error actually names.
+                # Never strip a thinking-disable: dropping it silently re-arms
+                # reasoning and bills a hidden-CoT token bomb on the retry.
+                if not stripped:
+                    named = [k for k in _STRIPPABLE
+                             if k != "thinking" and k in body and k in tl]
+                    if named:
+                        for k in named:
+                            body.pop(k, None)
+                        stripped = True
+                        log(f"[param-strip] model={model} http={r.status_code} "
+                            f"dropped={','.join(named)}")
+                        continue
+                # 2) Model-not-found: a 404 always means the id form is wrong;
+                # a 400/422 only if it names the model. Drive off the status
+                # code, not a body substring (some proxies omit "model").
+                if r.status_code == 404 or "model" in tl:
+                    alt = _alternate_model_form(body["model"])
+                    if not tried_alt and alt != body["model"]:
+                        log(f"[model-form-retry] {body['model']} -> {alt}")
+                        body["model"] = alt
+                        tried_alt = True
+                        continue
                     self.dead_models.add(model)
                     log(f"[model-dead] model={model} http={r.status_code}")
                     return CallResult(model_dead=True)
@@ -113,10 +142,11 @@ class FireworksClient:
                 log(f"[call-fail] model={model} http={r.status_code}")
                 return CallResult()
             # 429 / 5xx / anything else: transient, back off and retry
+            attempt += 1
             self.ledger["errors"] += 1
+            self.ledger["retries"] += 1
             log(f"[call-retryable] model={model} http={r.status_code} attempt={attempt}")
             self._backoff(attempt, deadline)
-            self.ledger["retries"] += 1
 
     def _backoff(self, attempt, deadline):
         pause = min(0.5 * (2 ** (attempt - 1)), 4.0)
@@ -127,16 +157,21 @@ class FireworksClient:
     def _handle_200(self, r, model, elapsed) -> CallResult:
         try:
             data = r.json()
-            content = data["choices"][0]["message"].get("content") or ""
+            msg = data["choices"][0]["message"]
         except (KeyError, IndexError, ValueError, TypeError):
             self.ledger["errors"] += 1
             log(f"[bad-response-shape] model={model}")
             return CallResult()
+        content = (msg.get("content") or "").strip()
 
         usage = data.get("usage") or {}
-        p = int(usage.get("prompt_tokens") or 0)
-        c = int(usage.get("completion_tokens") or 0)
-        t = int(usage.get("total_tokens") or (p + c))
+        try:
+            p = int(usage.get("prompt_tokens") or 0)
+            c = int(usage.get("completion_tokens") or 0)
+            t = int(usage.get("total_tokens") or (p + c))
+        except (ValueError, TypeError):
+            # a malformed usage field must not discard an otherwise-good answer
+            p = c = t = 0
         self.ledger["calls"] += 1
         self.ledger["prompt_tokens"] += p
         self.ledger["completion_tokens"] += c
@@ -145,10 +180,16 @@ class FireworksClient:
         vis = _visible_token_estimate(content)
         log(f"[call] model={model} t={elapsed:.1f}s prompt={p} completion={c} "
             f"total={t} visible~{vis}")
-        # Leak detection: completion tokens far beyond the visible answer
-        # means hidden reasoning is being billed.
+        # Leak detection on the VISIBLE content (before the reasoning fallback),
+        # so a mandatory-thinking model (empty content, huge completion) is still
+        # correctly flagged as billing hidden reasoning.
         if c > max(3 * vis, vis + 100):
             self.leak_strikes[model] = self.leak_strikes.get(model, 0) + 1
             log(f"[leak-suspect] model={model} strikes={self.leak_strikes[model]} "
                 f"completion={c} visible~{vis}")
+        # Best-effort recovery: if the answer came back only in reasoning_content
+        # (some mandatory-thinking models leave content empty), use it rather than
+        # shipping the static fallback. Never fires on the validated minimax path.
+        if not content:
+            content = (msg.get("reasoning_content") or "").strip()
         return CallResult(ok=True, content=content)

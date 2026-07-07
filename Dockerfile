@@ -1,5 +1,7 @@
 # syntax=docker/dockerfile:1
-FROM python:3.12-slim
+# Pin the platform so the graded linux/amd64 manifest is guaranteed regardless
+# of the build host or invocation (belt-and-suspenders with buildx --platform).
+FROM --platform=linux/amd64 python:3.12-slim
 
 WORKDIR /app
 

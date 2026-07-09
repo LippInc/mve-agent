@@ -17,7 +17,7 @@ _RULES = [
     ("ner", re.compile(r"\bentit(y|ies)\b|named entit|extract .*(people|persons?|organi[sz]ations?|locations?|dates?)")),
     ("code-debug", re.compile(r"\b(bug|debug|broken|error|incorrect|wrong output|fails?)\b.*\b(fix|correct)|\b(fix|find)\b.*\bbug")),
     ("code-gen", re.compile(r"\b(write|implement|create|build)\b.*\b(function|method|program|script|class)\b")),
-    ("math", re.compile(r"%|\bpercent|\$\d|\d+ ?(km|kg|miles|hours?|minutes?|dollars?|euros?)\b|how (many|much)|\baverage\b|\btotal\b|\bremain(s|ing)?\b|\bcost\b|\bprice\b|\brevenue\b|\bchange\b.*\bget\b|\bcalculate\b")),
+    ("math", re.compile(r"%|\bpercent|\$\d|\d+ ?(km|kg|miles|hours?|minutes?|dollars?|euros?)\b|how (many|much)|\baverage\b|\btotal\b|\bremain(s|ing)?\b|\bcost\b|\bprice\b|\brevenue\b|\bchange\b.*\bget\b|\bcalculate\b|\btimes\b|multiplied|divided by|\bplus\b|\bminus\b|\bsum of\b|what is \d[\d\s.,]*[+*/x×÷-]")),
     ("logic", re.compile(r"\bwho (owns?|is|wins?|finish|sits?|stands?)\b|each own|\bpuzzle\b|\bqueue\b|row of|\blabeled\b|\bconstraints?\b|if all .* are")),
 ]
 

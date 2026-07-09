@@ -12,6 +12,8 @@ terse call — plus two verified local-compute layers (stdlib-only):
 answer_task stays the single entry point main.py talks to.
 """
 
+import ast
+import operator
 import re
 import sys
 import time
@@ -65,6 +67,43 @@ _MATH_POT_SUFFIX = (
 )
 _EXPR_ALLOWED = re.compile(r"^[0-9+\-*/().\s]+$")
 
+_BIN_OPS = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul,
+    ast.Div: operator.truediv, ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+}
+
+
+def _safe_eval(expr: str):
+    """AST-walk arithmetic evaluator. Numbers and + - * / // % ** only, with
+    ** magnitude-bounded from the EVALUATED operands (|exp| <= 64, |base| <=
+    1e9) — a regex can never bound arithmetic magnitude (2**(999*999*999)
+    passes any textual guard), so the bound has to live at the AST node."""
+
+    def ev(node):
+        if isinstance(node, ast.Expression):
+            return ev(node.body)
+        if (isinstance(node, ast.Constant)
+                and isinstance(node.value, (int, float))
+                and not isinstance(node.value, bool)):
+            return node.value
+        if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.UAdd, ast.USub)):
+            v = ev(node.operand)
+            return v if isinstance(node.op, ast.UAdd) else -v
+        if isinstance(node, ast.BinOp):
+            if isinstance(node.op, ast.Pow):
+                base, exp = ev(node.left), ev(node.right)
+                if abs(exp) > 64 or abs(base) > 10 ** 9:
+                    raise ValueError("power out of bounds")
+                return base ** exp
+            fn = _BIN_OPS.get(type(node.op))
+            if fn is None:
+                raise ValueError("disallowed operator")
+            return fn(ev(node.left), ev(node.right))
+        raise ValueError("disallowed expression")
+
+    return ev(ast.parse(expr, mode="eval"))
+
 
 def _extract_expression(text: str) -> str:
     """Pull a bare arithmetic expression out of the reply (fences stripped)."""
@@ -72,22 +111,19 @@ def _extract_expression(text: str) -> str:
     candidates = [t] + [ln.strip() for ln in t.splitlines() if ln.strip()]
     for c in candidates:
         c = c.rstrip(";").strip()
-        if not (0 < len(c) <= 200 and _EXPR_ALLOWED.match(c)
+        if (0 < len(c) <= 200 and _EXPR_ALLOWED.match(c)
                 and any(ch.isdigit() for ch in c)):
-            continue
-        # exponent guard: an in-process eval of e.g. 9**9**9 would hang past
-        # every watchdog (eval is uninterruptible) — refuse 4+-digit exponents
-        # and directly-chained powers (a**b**c); separate powers in one formula
-        # (compound interest) stay legal because an operator sits between them
-        if re.search(r"\*\*\s*\(?\s*\d{4,}", c) or re.search(r"\*\*[\s\d.()]*\*\*", c):
-            continue
-        return c
+            return c
     return ""
 
 
-def _format_number(value) -> str:
+_MONEY_RX = re.compile(r"\$|dollars?|cents?|euros?|price|cost|owes?|pay|change")
+
+
+def _format_number(value, prompt: str = "") -> str:
     if isinstance(value, float):
-        value = round(value, 6)
+        # money reads as cents, not 6-decimal precision
+        value = round(value, 2 if _MONEY_RX.search(prompt.casefold()) else 6)
         if value.is_integer():
             return str(int(value))
     return str(value)
@@ -98,15 +134,24 @@ def _math_task(client, ladder, prompt: str, deadline) -> str:
     expr = _extract_expression(reply)
     if expr:
         try:
-            value = eval(expr, {"__builtins__": {}}, {})  # charset-validated arithmetic only
+            value = _safe_eval(expr)
             if isinstance(value, (int, float)):
-                _log(f"[pot] expr ok, local eval")
-                return _format_number(value)
+                _log("[pot] expr ok, local eval")
+                return _format_number(value, prompt)
         except Exception:
             pass
-    _log("[pot] no usable expression - plain fallback")
-    return _call(client, ladder, prompt + "\n\nGive only the final numeric answer.",
-                 deadline, 16)
+    # Salvage: the model often answers with the number itself instead of an
+    # expression — that IS the answer, no second call needed.
+    if reply:
+        m = re.fullmatch(r"[^\d\-]{0,12}(-?\d[\d,]*(?:\.\d+)?)\s*%?[.\s]{0,4}", reply.strip())
+        if m:
+            _log("[pot] salvaged bare number from reply")
+            return m.group(1).replace(",", "")
+    # Last resort: a possible misroute — answer in the general prose shape
+    # rather than forcing a bare number onto a question that may not want one.
+    _log("[pot] no usable expression - prose fallback")
+    fb = spec_for("factual")
+    return _call(client, ladder, prompt + fb["suffix"], deadline, fb["max_tokens"])
 
 
 # ---------------- summarization: local length verification ----------------
@@ -120,9 +165,17 @@ def _word_count(text: str) -> int:
     return len(re.findall(r"[A-Za-z0-9'\-]+", text))
 
 
+_PER_ITEM_RX = re.compile(r"\beach\b|\bper\s+(bullet|point|item|line|entity|sentence)\b", re.I)
+
+
 def _summarization_task(client, ladder, prompt: str, deadline, spec) -> str:
     m = _WORD_LIMIT_RX.search(prompt)
-    if not m:
+    # A per-item limit ("3 bullets, each under 8 words") must NOT be verified
+    # against the whole answer — the compress-retry would destroy a correct
+    # multi-item structure. Look for per-item markers only in the constraint
+    # clause itself: passage text says "each" all the time ("each day").
+    clause = prompt[max(0, m.start() - 48): m.end() + 48] if m else ""
+    if not m or _PER_ITEM_RX.search(clause):
         return _call(client, ladder, prompt + spec["suffix"], deadline,
                      spec["max_tokens"])
     limit = int(m.group(1))

@@ -394,14 +394,18 @@ def _try_local_math(local, prompt: str, deadline, local_only: bool = False) -> s
     (bench-measured) risk. In LOCAL_ONLY a bounded CoT pass joins as a
     tiebreaker, and the best single candidate ships rather than nothing."""
     budget = 26.0 if local_only else _LOCAL_MATH_BUDGET_S
-    local_deadline = min(deadline, time.monotonic() + budget)
+    reserve = 7.0 if local_only else 0.0
+    local_deadline = min(deadline - reserve, time.monotonic() + budget)
 
     def _guard(v):
-        # A negative answer to a "how many/number of" question is always
-        # wrong (measured: two derivations agreeing on a sign-slip -8).
+        # A negative answer to a "how many/number of" question is always a
+        # sign-slip (measured: derivations agreeing on -8 rabbits). The
+        # magnitude is what was derived — salvage abs() rather than reject:
+        # a wrong magnitude stays wrong either way, a backwards subtraction
+        # becomes the right answer.
         if v is not None and float(v) < 0 and _COUNT_Q_RX.search(prompt):
-            _log("[local-math] negative count rejected")
-            return None
+            _log("[local-math] negative count -> abs salvage")
+            return abs(float(v))
         return v
 
     def _expr_derivation(suffix):
@@ -444,7 +448,7 @@ def _try_local_math(local, prompt: str, deadline, local_only: bool = False) -> s
         # only time is budgeted (bounded by the caller's per-task deadline
         # and the global watchdog; total runtime is the binding contract
         # limit, not per-task time).
-        think_deadline = min(deadline, time.monotonic() + 70.0)
+        think_deadline = min(deadline - reserve, time.monotonic() + 70.0)
         cot_v = None
         if think_deadline - time.monotonic() > 8.0:
             reply = local.chat(prompt + _MATH_COT_SUFFIX, max_tokens=704,
@@ -572,7 +576,11 @@ def _try_local_short_agree(local, prompt: str, deadline, tag: str,
     a bounded CoT pass joins as a tiebreaker and the best single candidate
     ships rather than nothing."""
     budget = 26.0 if local_only else _LOCAL_NLP_BUDGET_S
-    local_deadline = min(deadline, time.monotonic() + budget)
+    # In LOCAL_ONLY always leave room for the raw-fallback shot: an empty
+    # answer is the one outcome worse than an unverified one (measured:
+    # budget exhaustion shipped "" on two tasks).
+    reserve = 7.0 if local_only else 0.0
+    local_deadline = min(deadline - reserve, time.monotonic() + budget)
 
     def _terse(suffix):
         return local.chat(prompt + suffix, max_tokens=32,
@@ -611,7 +619,7 @@ def _try_local_short_agree(local, prompt: str, deadline, tag: str,
         seen.append((norm, reply, computed))
     cot_ans = ""
     if local_only:
-        think_deadline = min(deadline, time.monotonic() + 70.0)
+        think_deadline = min(deadline - reserve, time.monotonic() + 70.0)
         if think_deadline - time.monotonic() > 8.0:
             reply = local.chat(prompt + _COT_SHORT_SUFFIX, max_tokens=704,
                                deadline=think_deadline)
@@ -694,9 +702,10 @@ def _try_local(local, category: str, prompt: str, deadline,
     if category == "logic" and "logic" in feats:
         return _try_local_short_agree(local, prompt, deadline, "local-logic",
                                       local_only=local_only)
-    if category == "factual" and "factual" in feats:
-        return _try_local_short_agree(local, prompt, deadline, "local-factual",
-                                      local_only=local_only)
+    # factual deliberately has NO verified path: agreement games truncate
+    # multi-part answers and program answers are nonsense for recall
+    # (measured: factual 7/7 via the rich raw path vs 4/7 via short-agree).
+    # In LOCAL_ONLY answer_task falls through to _local_raw for it.
     return None
 
 
@@ -709,10 +718,12 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
     if local is None or not local.available:
         return ""
     local_deadline = min(deadline, time.monotonic() + 70.0)
-    if category in ("math", "logic", "factual"):
+    if category in ("math", "logic"):
         # Reasoning tail: think, then extract the answer line. NEVER reuse the
         # remote-tuned tiny caps here — a local model's preamble would truncate
-        # into garbage (measured: math answers chopped at 16 tokens).
+        # into garbage (measured: math answers chopped at 16 tokens). Factual
+        # is NOT in this branch: answer-line extraction strips required detail
+        # ("Canberra" instead of the two-sentence answer the judge wants).
         reply = local.chat(prompt + _COT_SHORT_SUFFIX, max_tokens=704,
                            deadline=local_deadline)
         ans = _extract_final_answer(reply)

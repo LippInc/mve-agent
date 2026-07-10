@@ -381,18 +381,33 @@ _POT_PROG_SUFFIX = (
     "the code."
 )
 
+# Assignment/order puzzles: the model's wrong BELIEF repeats across framings
+# (agreement can't catch it) and freehand programs re-encode the belief.
+# Forcing the permutations-and-filter shape makes the program derive the
+# answer from the constraints instead (measured on the variant set: the
+# 5/8-logic misses are all in this class).
+_POT_LOGIC_SUFFIX = (
+    "\n\nWrite a short Python program that solves this puzzle by brute "
+    "force: enumerate every possible assignment with itertools.permutations, "
+    "keep only assignments satisfying EVERY stated constraint, and print "
+    "ONLY the answer to the question (no labels, no explanation). Use plain "
+    "Python (itertools allowed, no input(), no files, no network). Output "
+    "only the code."
+)
+
 
 _COMPUTED_RX = re.compile(r"\bfor\b|\bwhile\b|\bif\b|itertools|range\(")
 
 
-def _pot_program_answer(local, prompt: str, deadline):
+def _pot_program_answer(local, prompt: str, deadline, suffix=_POT_PROG_SUFFIX,
+                        max_tokens: int = 288):
     """Model writes a tiny program; we run it sandboxed. Returns
     (last_stdout_line, computed) or (None, False). `computed` is True when
     the program actually computes (loops/branches) rather than just printing
     a belief — a computed answer is stronger evidence than a terse reply."""
     if deadline - time.monotonic() < 3.0:
         return None, False
-    reply = local.chat(prompt + _POT_PROG_SUFFIX, max_tokens=288,
+    reply = local.chat(prompt + suffix, max_tokens=max_tokens,
                        deadline=deadline)
     code = codegate.extract_code(reply)
     if not code.strip() or len(code) > 2400 or "input(" in code:
@@ -606,6 +621,10 @@ def _try_local_short_agree(local, prompt: str, deadline, tag: str,
     a bounded CoT pass joins as a tiebreaker and the best single candidate
     ships rather than nothing."""
     budget = 26.0 if local_only else _LOCAL_NLP_BUDGET_S
+    if local_only and tag == "local-logic":
+        # Permutation programs take longer to write on 2 vCPU; local tokens
+        # are free and only the global watchdog binds.
+        budget = 34.0
     # In LOCAL_ONLY always leave room for the raw-fallback shot: an empty
     # answer is the one outcome worse than an unverified one (measured:
     # budget exhaustion shipped "" on two tasks).
@@ -620,18 +639,26 @@ def _try_local_short_agree(local, prompt: str, deadline, tag: str,
     # a terse reply is stronger evidence than two terse replies (a model's
     # wrong belief repeats across framings — measured on the pet-puzzle task —
     # but doesn't survive execution). A COMPUTED program answer also vetoes a
-    # terse-terse agreement that contradicts it.
+    # terse-terse agreement that contradicts it. Logic puzzles get the
+    # constraint-enumeration program shape (see _POT_LOGIC_SUFFIX).
+    prog_suffix = _POT_LOGIC_SUFFIX if tag == "local-logic" else _POT_PROG_SUFFIX
+    prog_tokens = 384 if tag == "local-logic" else 288
     samples = [lambda: _terse(_SHORT_ANSWER_SUFFIXES[0]),
-               lambda: _pot_program_answer(local, prompt, local_deadline),
+               lambda: _pot_program_answer(local, prompt, local_deadline,
+                                           suffix=prog_suffix,
+                                           max_tokens=prog_tokens),
                lambda: _terse(_SHORT_ANSWER_SUFFIXES[1]),
                lambda: _terse(_SHORT_ANSWER_SUFFIXES[2])]
 
     seen = []          # (norm, reply, computed)
     computed_norm = None
+    first_text = ""    # any non-empty reply: the guaranteed non-empty floor
     for sample in samples:
         if local_deadline - time.monotonic() < 1.5:
             break
         reply, computed = sample()
+        if reply and not first_text:
+            first_text = reply.strip()
         norm = _norm_short(reply)
         if not norm or len(norm.split()) > max_words:
             continue
@@ -662,11 +689,15 @@ def _try_local_short_agree(local, prompt: str, deadline, tag: str,
                         return prev_reply.strip().strip("\"'`")
             else:
                 cot_ans = ""
-    if local_only and (cot_ans or seen):
+    if local_only and (cot_ans or seen or first_text):
+        # Preference: computed program > short sample > CoT extract > any
+        # text at all. A starved task must never ship the fallback string
+        # while ANY sample produced text (measured: budget starvation under
+        # an all-logic task mix shipped two empties).
         computed = [r for _n, r, c in seen if c]
-        best = computed[0] if computed else (seen[0][1] if seen else cot_ans)
+        best = computed[0] if computed else (seen[0][1] if seen else "")
         if not best:
-            best = cot_ans
+            best = cot_ans or first_text
         _log(f"[{tag}] no agreement, LOCAL_ONLY - shipped best single")
         return best.strip().strip("\"'`")
     _log(f"[{tag}] no short-answer agreement -> remote")
@@ -763,6 +794,15 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
     reply = local.chat(prompt + spec["suffix"],
                        max_tokens=max(spec["max_tokens"], 96),
                        deadline=local_deadline)
+    if reply and category == "factual":
+        # A cap-truncated tail ("...the Hudson Riv") reads as broken to the
+        # judge — trim to the last complete sentence when one exists. Only
+        # factual: NER/summaries are not sentence-shaped.
+        r = reply.rstrip()
+        if r and r[-1] not in ".!?":
+            cut = max(r.rfind("."), r.rfind("!"), r.rfind("?"))
+            if cut >= 40:
+                reply = r[: cut + 1]
     if reply:
         _log(f"[local-raw] {category} raw local answer shipped")
     return (reply or "").strip()

@@ -68,14 +68,39 @@ def resolve_models(allowed_raw: str) -> list:
     return [_to_callable(m) for m in ladder]
 
 
-# Stage C local-inference layer (kill-switchable). Default OFF: the image only
-# runs local inference when LOCAL_LAYER is explicitly set, so the safe fallback
-# behaviour (remote-only) is what ships unless we opt in. "code" gates local
-# answers on prompt-derived example tests; "code+" also allows model-authored
-# self-tests (higher hit rate, only justified once accuracy margin is proven).
+# Local-inference layer (kill-switchable). Default OFF: the image only runs
+# local inference when LOCAL_LAYER is explicitly set, so the safe fallback
+# behaviour (remote-only) is what ships unless we opt in.
+#
+# LOCAL_LAYER is a comma-separated feature set; each feature is independently
+# kill-switchable so accuracy risk is dialed per category:
+#   code   — local code answers gated on prompt-derived example tests (coder model)
+#   code+  — code, plus model-authored self-test gates (higher hit rate)
+#   math   — local Program-of-Thought, two independent derivations must agree
+#   sentiment — local label, two independent framings must agree (general model)
+#   ner    — local extraction, substring-verified + two-sample set agreement
+#   sum    — local summaries, hard word-limit verified (riskiest; margin-gated)
+# Legacy single values "off" / "code" / "code+" keep their Stage C meaning.
 LOCAL_LAYER_DEFAULT = "off"
 LOCAL_SERVER_DEFAULT = "/opt/llamacpp/llama-server"
 LOCAL_MODEL_DEFAULT = "/models/model.gguf"
+LOCAL_MODEL2_DEFAULT = "/models/general.gguf"
+
+_KNOWN_FEATURES = {"code", "code+", "math", "sentiment", "ner", "sum"}
+
+# Which features run on which model server. Coder-model features run in
+# phase 1, general-model features in phase 2 (one server lives at a time —
+# the 4 GB grading box cannot hold both models resident).
+CODER_FEATURES = {"code", "code+", "math"}
+GENERAL_FEATURES = {"sentiment", "ner", "sum"}
+
+
+def parse_local_features(raw: str) -> frozenset:
+    """'off'/'' -> empty set; otherwise the recognized feature names present.
+    Unknown tokens are dropped (a typo can never accidentally widen the risk
+    surface)."""
+    toks = {t.strip().casefold() for t in (raw or "").split(",")}
+    return frozenset(t for t in toks if t in _KNOWN_FEATURES)
 
 
 class Settings:
@@ -87,8 +112,10 @@ class Settings:
         self.models = resolve_models(self.allowed_raw)
 
         self.local_layer = env.get("LOCAL_LAYER", LOCAL_LAYER_DEFAULT).strip().lower()
+        self.local_features = parse_local_features(self.local_layer)
         self.local_server = env.get("LOCAL_SERVER", LOCAL_SERVER_DEFAULT).strip()
         self.local_model = env.get("LOCAL_MODEL", LOCAL_MODEL_DEFAULT).strip()
+        self.local_model2 = env.get("LOCAL_MODEL2", LOCAL_MODEL2_DEFAULT).strip()
         try:
             self.local_port = int(env.get("LOCAL_PORT", "8080"))
         except ValueError:
@@ -99,6 +126,16 @@ class Settings:
             self.local_threads = 2
         self.local_ctx = 4096
         self.local_boot_budget_s = 40.0
+
+    @property
+    def code_mode(self) -> str:
+        """Stage C compatibility: the code-gate strictness implied by the
+        feature set ("off" | "code" | "code+")."""
+        if "code+" in self.local_features:
+            return "code+"
+        if "code" in self.local_features:
+            return "code"
+        return "off"
 
     @property
     def online(self) -> bool:

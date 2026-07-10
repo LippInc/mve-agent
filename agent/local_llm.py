@@ -1,8 +1,13 @@
-"""Local llama.cpp server manager (Stage C).
+"""Local llama.cpp server manager (Stages C+D).
 
-Spawns the bundled runtime-dispatch `llama-server` as a subprocess once at
-startup and drives it over localhost HTTP (OpenAI-compatible). In-container
-local inference records ZERO Fireworks proxy tokens.
+Spawns the bundled runtime-dispatch `llama-server` as a subprocess and drives
+it over localhost HTTP (OpenAI-compatible). In-container local inference
+records ZERO Fireworks proxy tokens.
+
+Stage D runs up to two models — a coder (code + math-PoT) and a general
+instruct model (sentiment / ner / summarization) — but only ONE server lives
+at a time: the 4 GB grading box cannot hold both resident. main.py phases the
+tasks and swaps servers at the phase boundary.
 
 Everything here degrades gracefully: if the layer is disabled, the binary or
 model is missing, the server fails to become healthy, or a request errors, the
@@ -23,22 +28,31 @@ def _log(msg: str) -> None:
 
 
 class LocalLLM:
-    def __init__(self, settings):
+    """One llama-server instance for one model role.
+
+    role="coder"   -> settings.local_model  (code, code+, math features)
+    role="general" -> settings.local_model2 (sentiment, ner, sum features)
+    """
+
+    def __init__(self, settings, role: str = "coder"):
         self.available = False
         self.proc = None
+        self.role = role
+        self.features = settings.local_features
+        self.code_mode = settings.code_mode
         self.base = f"http://127.0.0.1:{settings.local_port}"
         self._client = None
-        self._mode = settings.local_layer  # "off" | "code" | "code+"
 
-        if self._mode == "off":
+        model = settings.local_model if role == "coder" else settings.local_model2
+        server = settings.local_server
+        if not self.features:
             _log("[local] layer disabled (LOCAL_LAYER=off)")
             return
-        server, model = settings.local_server, settings.local_model
         if not (server and os.path.exists(server)):
-            _log(f"[local] server binary absent -> disabled")
+            _log(f"[local] server binary absent -> {role} disabled")
             return
         if not (model and os.path.exists(model)):
-            _log(f"[local] model absent -> disabled")
+            _log(f"[local] {role} model absent -> disabled")
             return
         try:
             self.proc = subprocess.Popen(
@@ -49,21 +63,23 @@ class LocalLLM:
                  "--no-webui"],
                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         except Exception as e:
-            _log(f"[local] spawn failed: {type(e).__name__} -> disabled")
+            _log(f"[local] {role} spawn failed: {type(e).__name__} -> disabled")
             self.proc = None
             return
 
         self._client = httpx.Client(timeout=httpx.Timeout(30.0, connect=2.0))
         if self._wait_health(settings.local_boot_budget_s):
             self.available = True
-            _log(f"[local] server healthy, layer={self._mode}")
+            _log(f"[local] {role} server healthy, layer={','.join(sorted(self.features))}")
         else:
-            _log("[local] server did not become healthy -> disabled (remote only)")
+            _log(f"[local] {role} server did not become healthy -> disabled (remote only)")
             self.shutdown()
 
     @property
     def mode(self) -> str:
-        return self._mode if self.available else "off"
+        """Stage C compatibility: code-gate strictness while this server is
+        the active one ("off" unless the coder is up)."""
+        return self.code_mode if (self.available and self.role == "coder") else "off"
 
     def _wait_health(self, timeout_s: float) -> bool:
         deadline = time.monotonic() + timeout_s

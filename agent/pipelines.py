@@ -19,6 +19,7 @@ import sys
 import time
 
 from agent import codegate
+from agent import localgate
 from agent.categories import detect, spec_for
 
 
@@ -213,6 +214,11 @@ _SELFTEST_SUFFIX = (
     "the function above, using only literal inputs and expected outputs. Output "
     "only the asserts, one per line, no code fences."
 )
+_SELFTEST_SUFFIX2 = (
+    "\n\nWrite 4 assert statements checking this function on typical and edge "
+    "inputs. Each assert must compare a direct call against a literal expected "
+    "value, e.g. assert f(2) == 4. Asserts only, one per line."
+)
 
 
 def _extract_asserts(text: str) -> list:
@@ -289,6 +295,12 @@ def _try_local_code(local, prompt: str, category: str, deadline) -> str:
         tset = local.chat(code + _SELFTEST_SUFFIX, max_tokens=160,
                           deadline=local_deadline)
         tests = _extract_asserts(tset)
+        if len(tests) < 3 and local_deadline - time.monotonic() > 3.0:
+            # one rephrased retry: the first generation often yields non-literal
+            # or malformed asserts that the extractor (correctly) rejects.
+            tset2 = local.chat(code + _SELFTEST_SUFFIX2, max_tokens=200,
+                               deadline=local_deadline)
+            tests = _extract_asserts((tset or "") + "\n" + (tset2 or ""))
         gt = _gate_timeout(local_deadline)
         if len(tests) >= 3 and gt >= 1.0 and codegate.run_tests(code, tests, timeout=gt):
             discriminates = True
@@ -306,20 +318,181 @@ def _try_local_code(local, prompt: str, category: str, deadline) -> str:
     return None
 
 
+# ---------------- Stage D: verified local NLP (zero proxy tokens) ----------
+
+_LOCAL_MATH_BUDGET_S = 16.0
+_LOCAL_NLP_BUDGET_S = 18.0
+
+_MATH_POT_SUFFIX2 = (
+    "\n\nTranslate this problem into a single Python arithmetic expression "
+    "using only numbers and + - * / ( ). Reply with the expression alone."
+)
+_MATH_POT_SUFFIX3 = (
+    "\n\nSolve by writing one arithmetic expression that evaluates to the "
+    "answer (no words, no explanation). Expression only."
+)
+
+
+def _eval_expression(reply: str):
+    """Expression text -> numeric value, or None."""
+    expr = _extract_expression(reply)
+    if not expr:
+        return None
+    try:
+        value = _safe_eval(expr)
+    except Exception:
+        return None
+    return value if isinstance(value, (int, float)) else None
+
+
+def _try_local_math(local, prompt: str, deadline) -> str:
+    """Independently-framed local PoT derivations; ship as soon as any two
+    evaluate to the same number (2-of-3). Different phrasings decorrelate
+    surface slips; a residual correlated setup error is the accepted
+    (bench-measured) risk."""
+    local_deadline = min(deadline, time.monotonic() + _LOCAL_MATH_BUDGET_S)
+    values = []
+    for suffix in (_MATH_POT_SUFFIX, _MATH_POT_SUFFIX2, _MATH_POT_SUFFIX3):
+        if local_deadline - time.monotonic() < 1.5:
+            break
+        v = _eval_expression(local.chat(prompt + suffix, max_tokens=64,
+                                        deadline=local_deadline))
+        if v is None:
+            continue
+        for prev in values:
+            if abs(float(prev) - float(v)) <= 1e-9 * max(1.0, abs(float(v))):
+                _log("[local-math] two derivations agree - shipped local")
+                return _format_number(v, prompt)
+        values.append(v)
+    _log("[local-math] no two derivations agree -> remote")
+    return None
+
+
+_SENT_LOCAL_A = "\n\nAnswer with exactly one word - positive, negative, neutral, or mixed."
+_SENT_LOCAL_B = ("\n\nWhat is the overall sentiment? Reply with only one label "
+                 "from: positive, negative, neutral, mixed.")
+
+
+def _try_local_sentiment(local, prompt: str, deadline) -> str:
+    local_deadline = min(deadline, time.monotonic() + _LOCAL_NLP_BUDGET_S)
+    a = local.chat(prompt + _SENT_LOCAL_A, max_tokens=8, deadline=local_deadline)
+    if not a:
+        return None
+    b = local.chat(prompt + _SENT_LOCAL_B, max_tokens=8, deadline=local_deadline)
+    label = localgate.sentiment_agree(a, b)
+    if not label:
+        _log("[local-sent] framings disagree -> remote")
+        return None
+    reason = local.chat(
+        prompt + f"\n\nThe sentiment is {label}. State the key reason in at "
+                 "most 10 words.",
+        max_tokens=24, deadline=local_deadline)
+    reason = (reason or "").splitlines()[0].strip() if reason else ""
+    _log("[local-sent] agreed label - shipped local")
+    return f"{label} - {reason}" if reason else label
+
+
+_NER_LOCAL_B = ("\n\nExtract all named entities from the text. Output one per "
+                "line as: entity - type (person, organization, location, date, "
+                "or money). No other text.")
+_NER_LOCAL_C = ("\n\nList each named entity in the text on its own line in the "
+                "form 'entity - type', covering every person, organization, "
+                "location, date, and monetary amount. Output nothing else.")
+
+
+def _try_local_ner(local, prompt: str, deadline) -> str:
+    """Up to three independently-framed extractions; ship as soon as any two
+    substring-verified samples agree on the full (entity, type) set. Every
+    shipped entity is verbatim-in-source (kills hallucination); the set
+    agreement is the completeness evidence."""
+    local_deadline = min(deadline, time.monotonic() + _LOCAL_NLP_BUDGET_S + 6.0)
+    spec = spec_for("ner")
+    verified = []
+    for suffix in (spec["suffix"], _NER_LOCAL_B, _NER_LOCAL_C):
+        if local_deadline - time.monotonic() < 2.0:
+            break
+        pairs = localgate.parse_entity_lines(
+            local.chat(prompt + suffix, max_tokens=spec["max_tokens"],
+                       deadline=local_deadline))
+        if not localgate.ner_verify(pairs, prompt):
+            continue
+        for prev in verified:
+            if localgate.ner_sets_agree(prev, pairs):
+                _log(f"[local-ner] {len(pairs)} entities agreed - shipped local")
+                return localgate.format_entities(pairs)
+        verified.append(pairs)
+    _log("[local-ner] no two verified samples agree -> remote")
+    return None
+
+
+def _try_local_sum(local, prompt: str, deadline) -> str:
+    """Local summaries ship ONLY when the task states a whole-answer word
+    limit we can verify deterministically; unconstrained summaries have no
+    local verifier and always stay remote."""
+    m = _WORD_LIMIT_RX.search(prompt)
+    if not m:
+        return None
+    clause = prompt[max(0, m.start() - 48): m.end() + 48]
+    if _PER_ITEM_RX.search(clause):
+        return None
+    limit = int(m.group(1))
+    target = max(5, (limit * 7) // 10)
+    local_deadline = min(deadline, time.monotonic() + _LOCAL_NLP_BUDGET_S)
+    draft = local.chat(
+        prompt + f"\n\nOutput only the summary, in at most {target} words. "
+                 f"Never exceed {limit} words.",
+        max_tokens=112, deadline=local_deadline)
+    if draft and localgate.word_count(draft) <= limit:
+        _log("[local-sum] within limit - shipped local")
+        return draft
+    if draft:
+        shorter = local.chat(
+            f"Shorten this to at most {target} words, keeping the meaning and "
+            f"format. Output only the result.\n\n{draft}",
+            max_tokens=112, deadline=local_deadline)
+        if shorter and localgate.word_count(shorter) <= limit:
+            _log("[local-sum] compressed within limit - shipped local")
+            return shorter
+    _log("[local-sum] over limit -> remote")
+    return None
+
+
+def _try_local(local, category: str, prompt: str, deadline) -> str:
+    """Dispatch to the verified local path for this category, if the active
+    server's role and the enabled feature set cover it. None -> remote."""
+    if local is None or not local.available:
+        return None
+    feats = local.features
+    if category in ("code-debug", "code-gen") and local.mode != "off":
+        return _try_local_code(local, prompt, category, deadline)
+    if local.role == "coder":
+        if category == "math" and "math" in feats:
+            return _try_local_math(local, prompt, deadline)
+        return None
+    # general model phase
+    if category == "sentiment" and "sentiment" in feats:
+        return _try_local_sentiment(local, prompt, deadline)
+    if category == "ner" and "ner" in feats:
+        return _try_local_ner(local, prompt, deadline)
+    if category == "summarization" and "sum" in feats:
+        return _try_local_sum(local, prompt, deadline)
+    return None
+
+
 # ---------------- entry point ----------------
 
-def answer_task(client, ladder, prompt: str, deadline, local=None) -> str:
+def answer_task(client, ladder, prompt: str, deadline, local=None,
+                category: str = None) -> str:
     """Route, shape, verify. Returns the answer text or "" when nothing
     succeeded (caller applies the static fallback)."""
-    category = detect(prompt)
+    if category is None:
+        category = detect(prompt)
     spec = spec_for(category)
     _log(f"[route] category={category} cap={spec['max_tokens']}")
 
-    if (local is not None and local.mode != "off"
-            and category in ("code-debug", "code-gen")):
-        ans = _try_local_code(local, prompt, category, deadline)
-        if ans:
-            return ans  # verified locally -> zero proxy tokens
+    ans = _try_local(local, category, prompt, deadline)
+    if ans:
+        return ans  # verified locally -> zero proxy tokens
 
     if category == "math":
         return _math_task(client, ladder, prompt, deadline)

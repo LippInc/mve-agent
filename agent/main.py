@@ -124,24 +124,60 @@ def main() -> int:
     else:
         log("[offline] missing env config - shipping fallback answers")
 
-    # Stage C local-inference layer (off unless LOCAL_LAYER is set). Started
-    # after the insurance write so a slow model load never delays first output;
-    # fully guarded so it can never defeat the exit-0 rail. Only spawned when we
-    # actually have a remote path to fall back on (online) — no point paying the
-    # health-wait for a layer the task loop would never reach.
+    # Local-inference layer (off unless LOCAL_LAYER is set). Two model roles,
+    # one server alive at a time (4 GB box): tasks are processed in two phases
+    # — coder-model categories first (code, math), then everything else with
+    # the general model. Fully guarded so it can never defeat the exit-0 rail;
+    # only spawned when we actually have a remote path to fall back on.
     local = None
-    if client is not None and settings.local_layer != "off":
+    coder_needed = general_needed = False
+    if client is not None and settings.local_features:
+        try:
+            from agent.config import CODER_FEATURES, GENERAL_FEATURES
+            coder_needed = bool(settings.local_features & CODER_FEATURES)
+            general_needed = bool(settings.local_features & GENERAL_FEATURES)
+        except Exception:
+            pass
+
+    # Phase order: coder-category tasks first, original order inside each
+    # phase. Output order is unaffected (results keyed by task_id).
+    CODER_CATS = ("code-debug", "code-gen", "math")
+    if client is not None:
+        try:
+            from agent.categories import detect
+            for t in tasks:
+                t["category"] = detect(t["prompt"])
+        except Exception:
+            for t in tasks:
+                t["category"] = None
+        if coder_needed or general_needed:
+            tasks = ([t for t in tasks if t["category"] in CODER_CATS]
+                     + [t for t in tasks if t["category"] not in CODER_CATS])
+
+    def start_local(role):
         try:
             from agent.local_llm import LocalLLM
-            local = LocalLLM(settings)
+            inst = LocalLLM(settings, role=role)
+            return inst if inst.available else None
         except Exception as e:
-            local = None
-            log(f"[local] init guard: {type(e).__name__} - remote only")
+            log(f"[local] init guard ({role}): {type(e).__name__} - remote only")
+            return None
+
+    if client is not None and coder_needed:
+        local = start_local("coder")
 
     deadline_global = BOOT + TOTAL_BUDGET_S
+    general_started = False
     for i, t in enumerate(tasks):
         if client is None:
             break
+        # Phase boundary: first non-coder-category task -> swap servers.
+        if (general_needed and not general_started
+                and t.get("category") not in CODER_CATS):
+            general_started = True
+            if local is not None:
+                local.shutdown()
+            local = start_local("general")
         now = time.monotonic()
         remaining = deadline_global - now - WRITE_MARGIN_S
         n_left = len(tasks) - i
@@ -155,7 +191,7 @@ def main() -> int:
                 log("[watchdog] no models left alive")
                 break
             ans = pipelines.answer_task(client, current, t["prompt"], now + budget,
-                                        local=local)
+                                        local=local, category=t.get("category"))
             if ans:
                 answers[t["task_id"]] = str(ans)
         except Exception as e:  # per-task isolation: one bad task never kills the run

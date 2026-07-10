@@ -1,0 +1,60 @@
+# syntax=docker/dockerfile:1
+# Stage D image: Stage B agent + runtime-dispatch llama.cpp + TWO local models
+# (coder for code/math-PoT, general instruct for sentiment/NER/summaries), all
+# behind per-category verifiers and per-category kill-switch flags.
+#
+# Assets are pre-staged into vendor/ by ops/fetch-stage-d-assets.ps1
+# (gitignored, too large for git). The llama.cpp tarball is extracted HERE,
+# inside the Linux build, because Windows tar cannot create the .so symlinks.
+#
+# LOCAL_FLAGS is a build arg so each push can dial the enabled categories
+# without touching code: e.g.
+#   --build-arg LOCAL_FLAGS=code+,math,sentiment,ner        (Stage D default)
+#   --build-arg LOCAL_FLAGS=code+,math,sentiment,ner,sum    (max local)
+#   --build-arg LOCAL_FLAGS=code+                           (Stage C behavior)
+
+# ---- extract llama.cpp (Linux tar handles the symlinks) ----
+FROM debian:bookworm-slim AS llamacpp
+WORKDIR /opt/llamacpp
+COPY vendor/llamacpp.tar.gz /tmp/llamacpp.tar.gz
+RUN tar -xzf /tmp/llamacpp.tar.gz -C /opt/llamacpp --strip-components=1 \
+    && rm /tmp/llamacpp.tar.gz \
+    && test -x /opt/llamacpp/llama-server
+
+# ---- final image ----
+FROM --platform=linux/amd64 python:3.12-slim
+WORKDIR /app
+
+# libgomp1 = the OpenMP runtime ggml-cpu links against.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Runtime-dispatch llama.cpp (llama-server + all libggml-cpu-*.so must sit in
+# the same dir; dispatch searches the executable's own directory).
+COPY --from=llamacpp /opt/llamacpp/ /opt/llamacpp/
+RUN chmod +x /opt/llamacpp/llama-server
+ENV PATH="/opt/llamacpp:${PATH}"
+
+# Bundled local models: coder (code + math PoT) and general instruct
+# (sentiment / NER / summarization). One llama-server lives at a time.
+COPY vendor/models/model.gguf /models/model.gguf
+COPY vendor/models/general.gguf /models/general.gguf
+
+COPY agent/ ./agent/
+
+ARG LOCAL_FLAGS="code+,math,sentiment,ner"
+
+# The graded harness injects only FIREWORKS_*/ALLOWED_MODELS, never LOCAL_*,
+# so these ENVs are what grades.
+ENV LOCAL_LAYER=${LOCAL_FLAGS} \
+    LOCAL_SERVER=/opt/llamacpp/llama-server \
+    LOCAL_MODEL=/models/model.gguf \
+    LOCAL_MODEL2=/models/general.gguf \
+    LOCAL_PORT=8080 \
+    LOCAL_THREADS=2
+
+ENTRYPOINT ["python", "-m", "agent.main"]

@@ -36,7 +36,16 @@ _SUMMAR_RX = re.compile(
     # fewer." must stay math)
     r"|^in (at most |no more than |under |fewer than )?\d+ words"
     r"|what (is|are) (this|these|it) saying"
-    r"|^in (a single|one) (sentence|line)\b")
+    r"|^in (a single|one) (sentence|line)\b"
+    # "compress/distill the following ..." and "<verb> ... into exactly N
+    # sentences" are summarization asks _SUMMAR_RX missed (refresh-gauntlet
+    # 2026-07-10: "compress the following into exactly two sentences" routed
+    # to math and shipped a bare number). Verb-coupled + "sentences?" keeps
+    # code prompts ("compress a list into a string in python") out.
+    r"|\b(compress|distill)\b[\s\S]{0,24}?\b(passage|text|article|paragraph"
+    r"|report|story|following)\b"
+    r"|\b(compress|condense|distill|shorten|reduce|rewrite|rephrase)\b"
+    r"[\s\S]{0,60}?\binto (exactly )?(one|two|three|four|five|\d+) sentences?\b")
 _NER_RX = re.compile(
     r"\bentit(y|ies)\b|named entit"
     r"|\b(extract|identify|list|find|pull out|name)\b[\s\S]{0,80}?"
@@ -87,7 +96,15 @@ _LOGIC_RX = re.compile(
     # "four friends each chose a different dessert" - assignment puzzles
     r"|(each|all)[\s\S]{0,40}?\bdifferent\b|each own"
     r"|knights?\b[\s\S]{0,60}?\bknaves?|\bknave\b|always (tells? the truth|lies?)"
-    r"|\bpuzzle\b|\bqueue\b|row of|\blabeled\b|\bconstraints?\b|if all .* are")
+    r"|\bpuzzle\b|\bqueue\b|row of|\blabeled\b|\bconstraints?\b|if all .* are"
+    # Ordering/assignment puzzles phrased without "who"/"different" fell to
+    # factual, whose raw path violates format constraints and rambles
+    # (refresh-gauntlet 2026-07-10: "each assigned to exactly one of four
+    # labs", "In what order did they finish?"). Nouns list is deliberately
+    # assignment-shaped (no team/group - "which team won the cup" is factual).
+    r"|in (what|which) order (did|do|does|will)\b"
+    r"|\beach\b[\s\S]{0,40}?\bassigned to\b|assigned to (exactly )?one of\b"
+    r"|which (lab|desk|seat|room|house|floor|table|office|locker|shelf)\b")
 
 
 def _is_math(p: str) -> bool:

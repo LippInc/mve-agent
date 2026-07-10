@@ -740,7 +740,46 @@ def _bullet_count(text: str) -> int:
     return sum(1 for ln in text.splitlines() if _BULLET_LINE_RX.match(ln))
 
 
-def _try_local_sum_structured(local, prompt: str, deadline) -> str:
+# Content anchors: distinctive tokens a faithful summary should echo —
+# digits, spelled quantities, and mid-sentence proper nouns from the passage.
+# Refresh-gauntlet 2026-07-10: 10 of 20 blind summaries were count-valid but
+# content-hollow ("generic filler"); count verification alone cannot see that.
+_ANCHOR_NUM_RX = re.compile(r"\d[\d,.]*%?")
+_ANCHOR_NUMWORD_RX = re.compile(
+    r"\b(one|two|three|four|five|six|seven|eight|nine|ten|eleven|twelve"
+    r"|twenty|thirty|forty|fifty|sixty|seventy|eighty|ninety|hundred"
+    r"|thousand|million|billion|dozen|half|third|quarter|percent)\b")
+_ANCHOR_PROPER_RX = re.compile(r"(?<=[a-z,;] )[A-Z][a-z]{3,}")
+
+
+def _sum_content_ok(prompt: str, draft: str) -> bool:
+    """True when the draft echoes at least one distinctive content token of
+    the source. A no-anchor source passes trivially."""
+    anchors = {a for a in _ANCHOR_NUM_RX.findall(prompt) if len(a) >= 2}
+    anchors |= set(_ANCHOR_NUMWORD_RX.findall(prompt.casefold()))
+    anchors |= {m.casefold() for m in _ANCHOR_PROPER_RX.findall(prompt)}
+    if not anchors:
+        return True
+    d = draft.casefold()
+    return any(a in d for a in anchors)
+
+
+def _sum_ship(prompt: str, draft: str, hybrid: bool, what: str) -> str:
+    """Central summarization ship gate: hollow drafts escalate in hybrid mode
+    (remote rescue exists), ship as-is otherwise (LOCAL_ONLY/legacy — an
+    on-format local summary beats nothing)."""
+    if _sum_content_ok(prompt, draft):
+        _log(f"[local-sum] {what} verified - shipped local")
+        return draft
+    if hybrid:
+        _log(f"[local-sum] {what} count-valid but content-hollow -> remote")
+        return None
+    _log(f"[local-sum] {what} verified (hollow, no rescue) - shipped local")
+    return draft
+
+
+def _try_local_sum_structured(local, prompt: str, deadline,
+                              hybrid: bool = False) -> str:
     """Sentence-count and bullet-count constraints are as deterministic as
     word limits — verify locally, one corrective retry, else remote.
     (Verifies FORMAT; faithfulness rides on the same local-model trust the
@@ -762,15 +801,13 @@ def _try_local_sum_structured(local, prompt: str, deadline) -> str:
         draft = local.chat(prompt + "\n\nOutput only the one-sentence summary.",
                            max_tokens=96, deadline=local_deadline)
         if draft and _sentence_count(draft) == 1:
-            _log("[local-sum] one-sentence verified - shipped local")
-            return draft
+            return _sum_ship(prompt, draft, hybrid, "one-sentence")
         if draft:
             redo = local.chat("Rewrite this as exactly ONE sentence. Output "
                               f"only the sentence.\n\n{draft}",
                               max_tokens=96, deadline=local_deadline)
             if redo and _sentence_count(redo) == 1:
-                _log("[local-sum] one-sentence rewrite verified - shipped local")
-                return redo
+                return _sum_ship(prompt, redo, hybrid, "one-sentence rewrite")
         return None
     mb = _BULLET_ASK_RX.search(instr)
     if mb:
@@ -783,19 +820,19 @@ def _try_local_sum_structured(local, prompt: str, deadline) -> str:
                          "line, each starting with '- '.",
                 max_tokens=160, deadline=local_deadline)
             if draft and _bullet_count(draft) == want:
-                _log("[local-sum] bullet-count verified - shipped local")
-                return draft
+                return _sum_ship(prompt, draft, hybrid, "bullet-count")
         return None
     return None
 
 
-def _try_local_sum(local, prompt: str, deadline) -> str:
+def _try_local_sum(local, prompt: str, deadline, hybrid: bool = False) -> str:
     """Local summaries ship ONLY when the task states a deterministically
     verifiable constraint: a whole-answer word limit, an exact sentence
-    count, or a bullet count. Unconstrained summaries stay remote."""
+    count, or a bullet count. Unconstrained summaries stay remote. In hybrid
+    mode a count-valid but content-hollow draft escalates too (_sum_ship)."""
     m = _WORD_LIMIT_RX.search(prompt)
     if not m:
-        return _try_local_sum_structured(local, prompt, deadline)
+        return _try_local_sum_structured(local, prompt, deadline, hybrid=hybrid)
     clause = prompt[max(0, m.start() - 90): m.end() + 48]
     if _PER_ITEM_RX.search(clause):
         return None
@@ -807,16 +844,14 @@ def _try_local_sum(local, prompt: str, deadline) -> str:
                  f"Never exceed {limit} words.",
         max_tokens=112, deadline=local_deadline)
     if draft and localgate.word_count(draft) <= limit:
-        _log("[local-sum] within limit - shipped local")
-        return draft
+        return _sum_ship(prompt, draft, hybrid, "within-limit")
     if draft:
         shorter = local.chat(
             f"Shorten this to at most {target} words, keeping the meaning and "
             f"format. Output only the result.\n\n{draft}",
             max_tokens=112, deadline=local_deadline)
         if shorter and localgate.word_count(shorter) <= limit:
-            _log("[local-sum] compressed within limit - shipped local")
-            return shorter
+            return _sum_ship(prompt, shorter, hybrid, "compressed within-limit")
     _log("[local-sum] over limit -> remote")
     return None
 
@@ -844,7 +879,8 @@ def _try_local(local, category: str, prompt: str, deadline,
     if category == "ner" and "ner" in feats:
         return _try_local_ner(local, prompt, deadline)
     if category == "summarization" and "sum" in feats:
-        return _try_local_sum(local, prompt, deadline)
+        return _try_local_sum(local, prompt, deadline,
+                              hybrid=bool(hybrid_policy) and not local_only)
     if category == "logic" and "logic" in feats:
         return _try_local_short_agree(local, prompt, deadline, "local-logic",
                                       local_only=local_only,
@@ -865,18 +901,29 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
     if local is None or not local.available:
         return ""
     local_deadline = min(deadline, time.monotonic() + 70.0)
+    floor = ""
     if category in ("math", "logic"):
         # Reasoning tail: think, then extract the answer line. NEVER reuse the
         # remote-tuned tiny caps here — a local model's preamble would truncate
         # into garbage (measured: math answers chopped at 16 tokens). Factual
         # is NOT in this branch: answer-line extraction strips required detail
         # ("Canberra" instead of the two-sentence answer the judge wants).
+        # The CoT call gets a capped sub-deadline so its timeout can never eat
+        # the whole budget — the terse fallback below must always get its shot
+        # (refresh-gauntlet 2026-07-10: three 28.0s CoT timeouts each returned
+        # "" AND starved the follow-up, shipping empty answers). Budget-aware:
+        # reserve 8 s for the fallback, otherwise give CoT everything up to
+        # 26 s (just under the 28 s transport cap — a flat 18 s cap regressed
+        # logic-03's deep-thinking rescue on rich budgets).
+        avail = local_deadline - time.monotonic()
+        cot_deadline = time.monotonic() + min(26.0, max(4.0, avail - 8.0))
         reply = local.chat(prompt + _COT_SHORT_SUFFIX, max_tokens=704,
-                           deadline=local_deadline)
+                           deadline=cot_deadline)
         ans = _extract_final_answer(reply)
         if ans:
             _log(f"[local-raw] {category} thinking answer shipped")
             return ans
+        floor = (reply or "").strip()
     reply = local.chat(prompt + spec["suffix"],
                        max_tokens=max(spec["max_tokens"], 96),
                        deadline=local_deadline)
@@ -891,7 +938,25 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
                 reply = r[: cut + 1]
     if reply:
         _log(f"[local-raw] {category} raw local answer shipped")
-    return (reply or "").strip()
+    # Last-resort floor: a partial CoT trace beats an empty answer (the
+    # caller's static fallback is a guaranteed judge-fail; partial text at
+    # least carries content).
+    return (reply or "").strip() or floor
+
+
+# >=3 segments of >=3 chars each: 'KaiLiorJaeIda' splits, 'McDonald'/'JoAnne'
+# (single names with internal caps) stay untouched.
+_SMASHED_NAMES_RX = re.compile(r"^[A-Z][a-z]{2,}(?:[A-Z][a-z]{2,}){2,7}$")
+
+
+def _unsmash_names(ans: str) -> str:
+    """PoT ordering programs sometimes print ''.join(names) — 'KaiLiorJaeIda'.
+    The content is right; the judge shouldn't have to parse CamelCase. Only
+    touches short, whitespace-free, all-alpha CamelCase runs."""
+    a = ans.strip()
+    if len(a) <= 60 and _SMASHED_NAMES_RX.match(a):
+        return re.sub(r"(?<=[a-z])(?=[A-Z])", ", ", a)
+    return ans
 
 
 def answer_task(client, ladder, prompt: str, deadline, local=None,
@@ -904,14 +969,22 @@ def answer_task(client, ladder, prompt: str, deadline, local=None,
     spec = spec_for(category)
     _log(f"[route] category={category} cap={spec['max_tokens']}")
 
-    ans = _try_local(local, category, prompt, deadline, local_only=local_only,
-                     hybrid_policy=hybrid_policy)
+    # LOCAL_ONLY: the verified paths must never eat the whole task budget —
+    # _local_raw is the only fallback (no remote), so reserve it a window.
+    # (Refresh-gauntlet 2026-07-10: math PoT retries burned a full 75 s and
+    # the task shipped EMPTY because _local_raw got scraps.)
+    verified_deadline = deadline - 9.0 if local_only else deadline
+    ans = _try_local(local, category, prompt, verified_deadline,
+                     local_only=local_only, hybrid_policy=hybrid_policy)
     if ans:
+        if category == "logic":
+            ans = _unsmash_names(ans)
         return ans  # verified locally -> zero proxy tokens
 
     if local_only:
         # NEVER call remote in this mode - the token score must stay 0.
-        return _local_raw(local, category, prompt, deadline, spec)
+        ans = _local_raw(local, category, prompt, deadline, spec)
+        return _unsmash_names(ans) if category == "logic" and ans else ans
 
     if category == "math":
         return _math_task(client, ladder, prompt, deadline)

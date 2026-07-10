@@ -193,7 +193,21 @@ def main() -> int:
             general_started = True
             if local is not None:
                 local.shutdown()
-            local = start_local("general")
+                local = None
+            # The swap is the one block that can overrun the global budget
+            # unwatched (shutdown <=5s + boot <=local_boot_budget_s). Boot
+            # (and retry a failed boot once) only while the remaining budget
+            # can absorb a worst-case boot; otherwise skip the swap so the
+            # wall stays inside the runtime cap.
+            swap_floor = settings.local_boot_budget_s + 20.0
+            if deadline_global - time.monotonic() - WRITE_MARGIN_S > swap_floor:
+                local = start_local("general")
+                if (local is None and deadline_global - time.monotonic()
+                        - WRITE_MARGIN_S > swap_floor):
+                    log("[local] general boot failed - one retry")
+                    local = start_local("general")
+            else:
+                log("[watchdog] skipping general swap (budget too low)")
         now = time.monotonic()
         remaining = deadline_global - now - WRITE_MARGIN_S
         n_left = len(tasks) - i

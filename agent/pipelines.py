@@ -121,6 +121,12 @@ def _extract_expression(text: str) -> str:
 
 _MONEY_RX = re.compile(r"\$|dollars?|cents?|euros?|price|cost|owes?|pay|change")
 _COUNT_Q_RX = re.compile(r"how many|number of|count of", re.I)
+# Contexts where a negative quantity is a legitimate answer (overdrawn
+# balance, net loss, temperature drop): the abs() sign-slip salvage must
+# never fire there — it would corrupt a correct negative.
+_NEG_OK_RX = re.compile(
+    r"\$|dollars?|euros?|temperature|profit|loss|balance|debt"
+    r"|overdrawn?|below zero|net (change|gain|loss)", re.I)
 
 
 def _format_number(value, prompt: str = "") -> str:
@@ -160,8 +166,16 @@ def _math_task(client, ladder, prompt: str, deadline) -> str:
 # ---------------- summarization: local length verification ----------------
 
 _WORD_LIMIT_RX = re.compile(
-    r"(?:no more than|at most|fewer than|under|up to|maximum of|max(?:imum)?(?: of)?)\s+"
-    r"(\d+)\s+words?", re.I)
+    r"(?:no more than|at most|fewer than|under|up to|maximum of"
+    r"|max(?:imum)?(?: of)?|no longer than|within|in)\s+"
+    r"(\d+)\s+words?"
+    r"|(\d+)\s+words? or (?:fewer|less)"
+    r"|keep (?:it|the summary|this) (?:to|under|within)\s+(\d+)\s+words?", re.I)
+
+
+def _word_limit(m) -> int:
+    """First non-None capture across the alternations."""
+    return int(next(g for g in m.groups() if g))
 
 
 def _word_count(text: str) -> int:
@@ -176,12 +190,14 @@ def _summarization_task(client, ladder, prompt: str, deadline, spec) -> str:
     # A per-item limit ("3 bullets, each under 8 words") must NOT be verified
     # against the whole answer — the compress-retry would destroy a correct
     # multi-item structure. Look for per-item markers only in the constraint
-    # clause itself: passage text says "each" all the time ("each day").
-    clause = prompt[max(0, m.start() - 48): m.end() + 48] if m else ""
+    # clause itself: passage text says "each" all the time ("each day"). The
+    # pre-window is wide enough for "for each of the five ..., a headline of
+    # at most 8 words" while still excluding passage-embedded "each".
+    clause = prompt[max(0, m.start() - 90): m.end() + 48] if m else ""
     if not m or _PER_ITEM_RX.search(clause):
         return _call(client, ladder, prompt + spec["suffix"], deadline,
                      spec["max_tokens"])
-    limit = int(m.group(1))
+    limit = _word_limit(m)
     target = max(5, (limit * 7) // 10)  # models overshoot; aim well under
     draft = _call(
         client, ladder,
@@ -381,6 +397,10 @@ def _pot_program_answer(local, prompt: str, deadline):
     code = codegate.extract_code(reply)
     if not code.strip() or len(code) > 2400 or "input(" in code:
         return None, False
+    # The 1.0s floor deliberately runs the program even at the deadline edge:
+    # the overrun is bounded (~1s, inside WRITE_MARGIN_S) and a fast program
+    # whose output agrees with an existing sample still ships a free local
+    # answer (critic-verified: skipping here drops real ships).
     out = codegate.run_capture(code, timeout=min(6.0, max(1.0, deadline - time.monotonic())))
     if not out or not out.strip():
         return None, False
@@ -402,10 +422,17 @@ def _try_local_math(local, prompt: str, deadline, local_only: bool = False) -> s
         # sign-slip (measured: derivations agreeing on -8 rabbits). The
         # magnitude is what was derived — salvage abs() rather than reject:
         # a wrong magnitude stays wrong either way, a backwards subtraction
-        # becomes the right answer.
-        if v is not None and float(v) < 0 and _COUNT_Q_RX.search(prompt):
-            _log("[local-math] negative count -> abs salvage")
-            return abs(float(v))
+        # becomes the right answer. The negative-is-legit context check runs
+        # on the QUESTION CLAUSE only: "$12 tickets ... how many children?"
+        # asks a count (salvage), "how many dollars remain?" asks money
+        # (no salvage) — story-text money words must not suppress.
+        m = _COUNT_Q_RX.search(prompt)
+        if v is not None and float(v) < 0 and m:
+            qend = prompt.find("?", m.start())
+            clause = prompt[m.start(): qend if qend != -1 else len(prompt)]
+            if not _NEG_OK_RX.search(clause):
+                _log("[local-math] negative count -> abs salvage")
+                return abs(float(v))
         return v
 
     def _expr_derivation(suffix):
@@ -564,6 +591,9 @@ def _extract_final_answer(text: str) -> str:
 
 def _norm_short(text: str) -> str:
     t = re.sub(r"\s+", " ", (text or "").strip().strip("\"'`")).rstrip(".!")
+    # A program or reply that disobeys "no labels" with "Answer: X" still
+    # means X — strip the label so real agreements register.
+    t = re.sub(r"^(final\s+)?answer\s*[:=]\s*", "", t, flags=re.I)
     t = re.sub(r"^(the|a|an)\s+", "", t, flags=re.I)
     return t.casefold()
 
@@ -650,10 +680,10 @@ def _try_local_sum(local, prompt: str, deadline) -> str:
     m = _WORD_LIMIT_RX.search(prompt)
     if not m:
         return None
-    clause = prompt[max(0, m.start() - 48): m.end() + 48]
+    clause = prompt[max(0, m.start() - 90): m.end() + 48]
     if _PER_ITEM_RX.search(clause):
         return None
-    limit = int(m.group(1))
+    limit = _word_limit(m)
     target = max(5, (limit * 7) // 10)
     local_deadline = min(deadline, time.monotonic() + _LOCAL_NLP_BUDGET_S)
     draft = local.chat(

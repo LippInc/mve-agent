@@ -2,18 +2,28 @@
 # Stage C image: Stage B agent + a bundled runtime-dispatch llama.cpp CPU build
 # and a small code model for verified local code answers (zero proxy tokens).
 #
-# Assets are pre-staged into vendor/ by ops/fetch-stage-c-assets.ps1 (they are
-# gitignored — too large for git; the graded image bundles them). The llama.cpp
-# binary is built by upstream CI with GGML_CPU_ALL_VARIANTS runtime dispatch, so
-# it selects a compatible CPU kernel (down to an SSE2 baseline) and will not
-# SIGILL on the unknown grading CPU.
-FROM --platform=linux/amd64 python:3.12-slim
+# Assets are pre-staged into vendor/ by ops/fetch-stage-c-assets.ps1 (gitignored,
+# too large for git). vendor/llamacpp.tar.gz is the upstream ubuntu-x64 release
+# (built with GGML_CPU_ALL_VARIANTS runtime dispatch — selects a compatible CPU
+# kernel down to an SSE2 baseline, so it will NOT SIGILL on the unknown grading
+# CPU). It is extracted HERE, inside the Linux build, because Windows tar cannot
+# create the .so version symlinks.
 
+# ---- extract llama.cpp (Linux tar handles the symlinks) ----
+FROM debian:bookworm-slim AS llamacpp
+WORKDIR /opt/llamacpp
+COPY vendor/llamacpp.tar.gz /tmp/llamacpp.tar.gz
+RUN tar -xzf /tmp/llamacpp.tar.gz -C /opt/llamacpp --strip-components=1 \
+    && rm /tmp/llamacpp.tar.gz \
+    && test -x /opt/llamacpp/llama-server
+
+# ---- final image ----
+FROM --platform=linux/amd64 python:3.12-slim
 WORKDIR /app
 
-# libgomp1 = the OpenMP runtime ggml-cpu links against; ca-certificates for TLS.
+# libgomp1 = the OpenMP runtime ggml-cpu links against.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
+    && apt-get install -y --no-install-recommends libgomp1 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
@@ -21,7 +31,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Runtime-dispatch llama.cpp (llama-server + all libggml-cpu-*.so must sit in
 # the same dir; dispatch searches the executable's own directory).
-COPY vendor/llamacpp/ /opt/llamacpp/
+COPY --from=llamacpp /opt/llamacpp/ /opt/llamacpp/
 RUN chmod +x /opt/llamacpp/llama-server
 ENV PATH="/opt/llamacpp:${PATH}"
 

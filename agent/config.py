@@ -68,6 +68,16 @@ def resolve_models(allowed_raw: str) -> list:
     return [_to_callable(m) for m in ladder]
 
 
+# Stage C local-inference layer (kill-switchable). Default OFF: the image only
+# runs local inference when LOCAL_LAYER is explicitly set, so the safe fallback
+# behaviour (remote-only) is what ships unless we opt in. "code" gates local
+# answers on prompt-derived example tests; "code+" also allows model-authored
+# self-tests (higher hit rate, only justified once accuracy margin is proven).
+LOCAL_LAYER_DEFAULT = "off"
+LOCAL_SERVER_DEFAULT = "/opt/llamacpp/llama-server"
+LOCAL_MODEL_DEFAULT = "/models/model.gguf"
+
+
 class Settings:
     def __init__(self, env=None):
         env = env if env is not None else os.environ
@@ -75,6 +85,20 @@ class Settings:
         self.base_url = env.get("FIREWORKS_BASE_URL", "").strip().rstrip("/")
         self.allowed_raw = env.get("ALLOWED_MODELS", "").strip()
         self.models = resolve_models(self.allowed_raw)
+
+        self.local_layer = env.get("LOCAL_LAYER", LOCAL_LAYER_DEFAULT).strip().lower()
+        self.local_server = env.get("LOCAL_SERVER", LOCAL_SERVER_DEFAULT).strip()
+        self.local_model = env.get("LOCAL_MODEL", LOCAL_MODEL_DEFAULT).strip()
+        try:
+            self.local_port = int(env.get("LOCAL_PORT", "8080"))
+        except ValueError:
+            self.local_port = 8080
+        try:
+            self.local_threads = int(env.get("LOCAL_THREADS", "2"))
+        except ValueError:
+            self.local_threads = 2
+        self.local_ctx = 4096
+        self.local_boot_budget_s = 40.0
 
     @property
     def online(self) -> bool:

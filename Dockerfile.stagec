@@ -1,0 +1,43 @@
+# syntax=docker/dockerfile:1
+# Stage C image: Stage B agent + a bundled runtime-dispatch llama.cpp CPU build
+# and a small code model for verified local code answers (zero proxy tokens).
+#
+# Assets are pre-staged into vendor/ by ops/fetch-stage-c-assets.ps1 (they are
+# gitignored — too large for git; the graded image bundles them). The llama.cpp
+# binary is built by upstream CI with GGML_CPU_ALL_VARIANTS runtime dispatch, so
+# it selects a compatible CPU kernel (down to an SSE2 baseline) and will not
+# SIGILL on the unknown grading CPU.
+FROM --platform=linux/amd64 python:3.12-slim
+
+WORKDIR /app
+
+# libgomp1 = the OpenMP runtime ggml-cpu links against; ca-certificates for TLS.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends libgomp1 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt
+
+# Runtime-dispatch llama.cpp (llama-server + all libggml-cpu-*.so must sit in
+# the same dir; dispatch searches the executable's own directory).
+COPY vendor/llamacpp/ /opt/llamacpp/
+RUN chmod +x /opt/llamacpp/llama-server
+ENV PATH="/opt/llamacpp:${PATH}"
+
+# Bundled local code model.
+COPY vendor/models/model.gguf /models/model.gguf
+
+COPY agent/ ./agent/
+
+# Turn the local layer ON in the graded run (the harness injects only
+# FIREWORKS_*/ALLOWED_MODELS, never LOCAL_LAYER, so this ENV is what grades).
+# Flip to "off" (or build the plain Dockerfile) to ship the safe remote-only
+# fallback with no rebuild of the agent code.
+ENV LOCAL_LAYER=code+ \
+    LOCAL_SERVER=/opt/llamacpp/llama-server \
+    LOCAL_MODEL=/models/model.gguf \
+    LOCAL_PORT=8080 \
+    LOCAL_THREADS=2
+
+ENTRYPOINT ["python", "-m", "agent.main"]

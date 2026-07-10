@@ -3,3 +3,7 @@
 __pycache__/
 *.pyc
 .venv/
+# Stage C assets — bundled into the image, too large for git (see
+# ops/fetch-stage-c-assets.ps1). The graded image contains them; the repo
+# doesn't need to.
+vendor/

@@ -124,6 +124,17 @@ def main() -> int:
     else:
         log("[offline] missing env config - shipping fallback answers")
 
+    # Stage C local-inference layer (off unless LOCAL_LAYER is set). Started
+    # after the insurance write so a slow model load never delays first output;
+    # fully guarded so it can never defeat the exit-0 rail.
+    local = None
+    try:
+        from agent.local_llm import LocalLLM
+        local = LocalLLM(settings)
+    except Exception as e:
+        local = None
+        log(f"[local] init guard: {type(e).__name__} - remote only")
+
     deadline_global = BOOT + TOTAL_BUDGET_S
     for i, t in enumerate(tasks):
         if client is None:
@@ -140,7 +151,8 @@ def main() -> int:
             if not current:
                 log("[watchdog] no models left alive")
                 break
-            ans = pipelines.answer_task(client, current, t["prompt"], now + budget)
+            ans = pipelines.answer_task(client, current, t["prompt"], now + budget,
+                                        local=local)
             if ans:
                 answers[t["task_id"]] = str(ans)
         except Exception as e:  # per-task isolation: one bad task never kills the run
@@ -149,6 +161,8 @@ def main() -> int:
 
     wrote = atomic_write_results(results_list()) or wrote
 
+    if local is not None:
+        local.shutdown()
     if client is not None:
         led = client.ledger
         log(f"[ledger] calls={led['calls']} retries={led['retries']} "

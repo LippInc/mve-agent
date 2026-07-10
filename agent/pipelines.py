@@ -18,6 +18,7 @@ import re
 import sys
 import time
 
+from agent import codegate
 from agent.categories import detect, spec_for
 
 
@@ -198,14 +199,78 @@ def _summarization_task(client, ladder, prompt: str, deadline, spec) -> str:
     return shorter or draft
 
 
+# ---------------- Stage C: verified local code (zero proxy tokens) ----------
+
+_LOCAL_CODE_BUDGET_S = 22.0   # local generation must leave room for a remote fallback
+
+_CODE_LOCAL_SUFFIX = {
+    "code-debug": "\n\nState the bug in one short line, then give the corrected "
+                  "Python code in a ```python code block.",
+    "code-gen": "\n\nGive the Python code in a ```python code block. No explanation.",
+}
+_SELFTEST_SUFFIX = (
+    "\n\nWrite 3 Python assert statements that test the required behaviour of "
+    "the function above, using only literal inputs and expected outputs. Output "
+    "only the asserts, one per line, no code fences."
+)
+
+
+def _extract_asserts(text: str) -> list:
+    out = []
+    for ln in (text or "").splitlines():
+        ln = ln.strip().rstrip(";")
+        if ln.startswith("assert ") and "==" in ln:
+            out.append(ln)
+    return out[:5]
+
+
+def _try_local_code(local, prompt: str, category: str, deadline) -> str:
+    """Generate code locally and ship it ONLY if it passes a deterministic
+    gate. Returns the answer text on success, or None to fall back to remote.
+    Records zero proxy tokens on success (no Fireworks call made)."""
+    local_deadline = min(deadline, time.monotonic() + _LOCAL_CODE_BUDGET_S)
+    reply = local.chat(prompt + _CODE_LOCAL_SUFFIX[category], max_tokens=384,
+                       deadline=local_deadline)
+    code = codegate.extract_code(reply)
+    if not code.strip():
+        return None
+
+    # Gate 1 (always): tests derived from the prompt's own worked examples.
+    passed, n_examples = codegate.gate_code(prompt, code)
+    if passed:
+        _log(f"[local-code] {category} shipped (example-gate, {n_examples} tests)")
+        return reply.strip()
+
+    # Gate 2 ("code+" only): model-authored self-tests. Higher hit rate, small
+    # "confidently-wrong" risk -> only enabled once accuracy margin is proven.
+    if local.mode == "code+" and n_examples == 0:
+        tset = local.chat(code + _SELFTEST_SUFFIX, max_tokens=160,
+                          deadline=min(deadline, time.monotonic() + 12.0))
+        tests = _extract_asserts(tset)
+        # require >=2 non-trivial asserts AND that they actually exercise the code
+        if len(tests) >= 2 and codegate.run_tests(code, tests):
+            _log(f"[local-code] {category} shipped (self-test gate, {len(tests)} tests)")
+            return reply.strip()
+
+    _log(f"[local-code] {category} unverified -> remote fallback")
+    return None
+
+
 # ---------------- entry point ----------------
 
-def answer_task(client, ladder, prompt: str, deadline) -> str:
+def answer_task(client, ladder, prompt: str, deadline, local=None) -> str:
     """Route, shape, verify. Returns the answer text or "" when nothing
     succeeded (caller applies the static fallback)."""
     category = detect(prompt)
     spec = spec_for(category)
     _log(f"[route] category={category} cap={spec['max_tokens']}")
+
+    if (local is not None and local.mode != "off"
+            and category in ("code-debug", "code-gen")):
+        ans = _try_local_code(local, prompt, category, deadline)
+        if ans:
+            return ans  # verified locally -> zero proxy tokens
+
     if category == "math":
         return _math_task(client, ladder, prompt, deadline)
     if category == "summarization":

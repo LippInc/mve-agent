@@ -41,8 +41,10 @@ def _model_params(model: str) -> dict:
 
 def _call(client, ladder, text: str, deadline, max_tokens: int) -> str:
     """One shaped completion, walking the ladder best-first. Returns "" when
-    nothing succeeded."""
-    for model in list(ladder):
+    nothing succeeded. Ladder capped at 2 models: each advance is a fresh
+    billed call, and bench history shows the ladder virtually never needs to
+    advance (0/400+ calls) — the cap bounds the worst-case token blast."""
+    for model in list(ladder)[:2]:
         if model in client.dead_models:
             continue
         res = client.chat(
@@ -64,8 +66,8 @@ def _call(client, ladder, text: str, deadline, max_tokens: int) -> str:
 # ---------------- math: Program-of-Thought with local evaluation ----------------
 
 _MATH_POT_SUFFIX = (
-    "\n\nWrite one Python arithmetic expression that computes the final "
-    "answer. Output only the expression, nothing else."
+    "\n\nWrite one Python arithmetic expression for the answer. "
+    "Output only the expression."
 )
 _EXPR_ALLOWED = re.compile(r"^[0-9+\-*/().\s]+$")
 
@@ -108,13 +110,22 @@ def _safe_eval(expr: str):
 
 
 def _extract_expression(text: str) -> str:
-    """Pull a bare arithmetic expression out of the reply (fences stripped)."""
+    """Pull a bare arithmetic expression out of the reply (fences stripped).
+    Whole text first, then lines LAST-first: a model that shows work emits
+    intermediates before the final expression, so top-down order shipped a
+    mid-derivation step (critic-reproduced). Every candidate must actually
+    parse as an expression."""
     t = re.sub(r"```(?:python)?", "", text).strip().strip("`").strip()
-    candidates = [t] + [ln.strip() for ln in t.splitlines() if ln.strip()]
+    lines = [ln.strip() for ln in t.splitlines() if ln.strip()]
+    candidates = [t] + list(reversed(lines))
     for c in candidates:
         c = c.rstrip(";").strip()
         if (0 < len(c) <= 200 and _EXPR_ALLOWED.match(c)
                 and any(ch.isdigit() for ch in c)):
+            try:
+                ast.parse(c, mode="eval")
+            except SyntaxError:
+                continue
             return c
     return ""
 
@@ -614,12 +625,15 @@ def _norm_short(text: str) -> str:
 
 
 def _try_local_short_agree(local, prompt: str, deadline, tag: str,
-                           max_words: int = 8, local_only: bool = False) -> str:
+                           max_words: int = 8, local_only: bool = False,
+                           ship_best: bool = False) -> str:
     """2-of-3 agreement on a short final answer (logic / factual). Long or
     rambling replies never count as agreement evidence — a short exact match
-    across independently-framed asks is the confidence signal. In LOCAL_ONLY
-    a bounded CoT pass joins as a tiebreaker and the best single candidate
-    ships rather than nothing."""
+    across independently-framed asks is the confidence signal. When
+    ship_best is set (LOCAL_ONLY, or hybrid policy h2) a bounded CoT pass
+    joins as a tiebreaker and the best single candidate ships rather than
+    escalating."""
+    ship_best = ship_best or local_only
     budget = 26.0 if local_only else _LOCAL_NLP_BUDGET_S
     if local_only and tag == "local-logic":
         # Permutation programs take longer to write on 2 vCPU; local tokens
@@ -675,7 +689,7 @@ def _try_local_short_agree(local, prompt: str, deadline, tag: str,
             return prev_reply.strip().strip("\"'`")
         seen.append((norm, reply, computed))
     cot_ans = ""
-    if local_only:
+    if ship_best:
         think_deadline = min(deadline - reserve, time.monotonic() + 70.0)
         if think_deadline - time.monotonic() > 8.0:
             reply = local.chat(prompt + _COT_SHORT_SUFFIX, max_tokens=704,
@@ -689,7 +703,7 @@ def _try_local_short_agree(local, prompt: str, deadline, tag: str,
                         return prev_reply.strip().strip("\"'`")
             else:
                 cot_ans = ""
-    if local_only and (cot_ans or seen or first_text):
+    if ship_best and (cot_ans or seen or first_text):
         # Preference: computed program > short sample > CoT extract > any
         # text at all. A starved task must never ship the fallback string
         # while ANY sample produced text (measured: budget starvation under
@@ -704,13 +718,84 @@ def _try_local_short_agree(local, prompt: str, deadline, tag: str,
     return None
 
 
+_ONE_SENTENCE_RX = re.compile(
+    r"exactly one sentence|in (a |one )?single sentence|in one sentence"
+    r"|one[- ]sentence summary", re.I)
+_BULLET_ASK_RX = re.compile(
+    r"(?:exactly\s+)?(\d+|two|three|four|five)\s+bullet(?:\s+point)?s?", re.I)
+_BULLET_LINE_RX = re.compile(r"^\s*(?:[-*•]|\d+[.)])\s+")
+_NUM_WORDS = {"two": 2, "three": 3, "four": 4, "five": 5}
+
+
+_ABBREV_RX = re.compile(
+    r"\b(Dr|Mr|Mrs|Ms|Prof|Sr|Jr|St|No|Inc|Ltd|Co|vs|etc|e\.g|i\.e|U\.S|U\.K)\.")
+
+
+def _sentence_count(text: str) -> int:
+    t = _ABBREV_RX.sub(lambda m: m.group(0)[:-1], text.strip())
+    return len(re.findall(r"[.!?]+[\"')\]]*(?=\s|$)", t))
+
+
+def _bullet_count(text: str) -> int:
+    return sum(1 for ln in text.splitlines() if _BULLET_LINE_RX.match(ln))
+
+
+def _try_local_sum_structured(local, prompt: str, deadline) -> str:
+    """Sentence-count and bullet-count constraints are as deterministic as
+    word limits — verify locally, one corrective retry, else remote.
+    (Verifies FORMAT; faithfulness rides on the same local-model trust the
+    word-limit path already ships on.) The trigger scan covers only the
+    INSTRUCTION regions (head/tail), never the embedded passage: a passage
+    that merely mentions "three bullet points" must not hijack the format
+    (critic-constructed regression). Per-item constraints bail like the
+    word-limit path."""
+    # Instruction head ends at the passage delimiter (the first colon) when
+    # one exists early; the tail catches trailing instructions.
+    head = prompt[:160]
+    if ":" in head:
+        head = head.split(":", 1)[0]
+    instr = head + "\n" + prompt[-120:]
+    if _PER_ITEM_RX.search(instr):
+        return None
+    local_deadline = min(deadline, time.monotonic() + _LOCAL_NLP_BUDGET_S)
+    if _ONE_SENTENCE_RX.search(instr):
+        draft = local.chat(prompt + "\n\nOutput only the one-sentence summary.",
+                           max_tokens=96, deadline=local_deadline)
+        if draft and _sentence_count(draft) == 1:
+            _log("[local-sum] one-sentence verified - shipped local")
+            return draft
+        if draft:
+            redo = local.chat("Rewrite this as exactly ONE sentence. Output "
+                              f"only the sentence.\n\n{draft}",
+                              max_tokens=96, deadline=local_deadline)
+            if redo and _sentence_count(redo) == 1:
+                _log("[local-sum] one-sentence rewrite verified - shipped local")
+                return redo
+        return None
+    mb = _BULLET_ASK_RX.search(instr)
+    if mb:
+        tok = mb.group(1).lower()
+        want = _NUM_WORDS.get(tok) if tok in _NUM_WORDS else (
+            int(tok) if tok.isdigit() else None)
+        if want and 1 < want <= 8:
+            draft = local.chat(
+                prompt + f"\n\nOutput only the {want} bullet points, one per "
+                         "line, each starting with '- '.",
+                max_tokens=160, deadline=local_deadline)
+            if draft and _bullet_count(draft) == want:
+                _log("[local-sum] bullet-count verified - shipped local")
+                return draft
+        return None
+    return None
+
+
 def _try_local_sum(local, prompt: str, deadline) -> str:
-    """Local summaries ship ONLY when the task states a whole-answer word
-    limit we can verify deterministically; unconstrained summaries have no
-    local verifier and always stay remote."""
+    """Local summaries ship ONLY when the task states a deterministically
+    verifiable constraint: a whole-answer word limit, an exact sentence
+    count, or a bullet count. Unconstrained summaries stay remote."""
     m = _WORD_LIMIT_RX.search(prompt)
     if not m:
-        return None
+        return _try_local_sum_structured(local, prompt, deadline)
     clause = prompt[max(0, m.start() - 90): m.end() + 48]
     if _PER_ITEM_RX.search(clause):
         return None
@@ -737,7 +822,7 @@ def _try_local_sum(local, prompt: str, deadline) -> str:
 
 
 def _try_local(local, category: str, prompt: str, deadline,
-               local_only: bool = False) -> str:
+               local_only: bool = False, hybrid_policy: str = "") -> str:
     """Dispatch to the verified local path for this category, if the active
     server's role and the enabled feature set cover it. None -> remote."""
     if local is None or not local.available:
@@ -762,7 +847,8 @@ def _try_local(local, category: str, prompt: str, deadline,
         return _try_local_sum(local, prompt, deadline)
     if category == "logic" and "logic" in feats:
         return _try_local_short_agree(local, prompt, deadline, "local-logic",
-                                      local_only=local_only)
+                                      local_only=local_only,
+                                      ship_best=local_only or hybrid_policy == "h2")
     # factual deliberately has NO verified path: agreement games truncate
     # multi-part answers and program answers are nonsense for recall
     # (measured: factual 7/7 via the rich raw path vs 4/7 via short-agree).
@@ -809,7 +895,8 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
 
 
 def answer_task(client, ladder, prompt: str, deadline, local=None,
-                category: str = None, local_only: bool = False) -> str:
+                category: str = None, local_only: bool = False,
+                hybrid_policy: str = "") -> str:
     """Route, shape, verify. Returns the answer text or "" when nothing
     succeeded (caller applies the static fallback)."""
     if category is None:
@@ -817,7 +904,8 @@ def answer_task(client, ladder, prompt: str, deadline, local=None,
     spec = spec_for(category)
     _log(f"[route] category={category} cap={spec['max_tokens']}")
 
-    ans = _try_local(local, category, prompt, deadline, local_only=local_only)
+    ans = _try_local(local, category, prompt, deadline, local_only=local_only,
+                     hybrid_policy=hybrid_policy)
     if ans:
         return ans  # verified locally -> zero proxy tokens
 

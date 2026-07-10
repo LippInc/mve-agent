@@ -101,13 +101,15 @@ def _is_math(p: str) -> bool:
 # suffix: appended to the task prompt (bills ~6-12 input tokens; buys back
 # hundreds of completion tokens). max_tokens: hard cap, sized with ~2x margin
 # over the largest legitimate answer so truncation can't corrupt a correct one.
+# Suffixes compressed 2026-07-10 (ladder-audit wave): every escalated call
+# bills its suffix; each rewrite preserves the output-shaping semantics.
 SPECS = {
     "math": {
         "suffix": "\n\nGive only the final numeric answer.",
         "max_tokens": 16,
     },
     "logic": {
-        "suffix": "\n\nGive only the final answer, no explanation.",
+        "suffix": "\n\nAnswer only, no explanation.",
         "max_tokens": 24,
     },
     "sentiment": {
@@ -115,25 +117,24 @@ SPECS = {
         "max_tokens": 48,
     },
     "summarization": {
-        "suffix": "\n\nFollow the requested length and format exactly. Output only the summary itself.",
+        "suffix": "\n\nFollow the length/format exactly. Output only the summary.",
         "max_tokens": 112,
     },
     "ner": {
-        "suffix": ("\n\nOutput only the entities, one per line, in the format: "
-                   "entity - type. Include every person, organization, location, "
-                   "date, and monetary amount. No other text."),
+        "suffix": ("\n\nOutput only lines of: entity - type. Include every "
+                   "person, organization, location, date, and monetary amount."),
         "max_tokens": 176,
     },
     "factual": {
-        "suffix": "\n\nAnswer directly and concisely in one or two short sentences.",
+        "suffix": "\n\nAnswer in 1-2 short sentences.",
         "max_tokens": 72,
     },
     "code-gen": {
-        "suffix": "\n\nOutput only the Python code, no explanation.",
+        "suffix": "\n\nPython code only, no explanation.",
         "max_tokens": 320,
     },
     "code-debug": {
-        "suffix": "\n\nState the bug in one short line, then output only the corrected code.",
+        "suffix": "\n\nOne-line bug statement, then only the fixed code.",
         "max_tokens": 320,
     },
 }

@@ -83,7 +83,9 @@ class FireworksClient:
         tried_alt = False
         while True:
             remaining = deadline - time.monotonic()
-            if remaining < 1.5 or attempt >= 4:
+            # One transient retry only: retries re-bill on 200s, and 0/400+
+            # bench calls ever needed more than one (ladder audit 2026-07-10).
+            if remaining < 1.5 or attempt >= 2:
                 return CallResult()
             t0 = time.monotonic()
             try:

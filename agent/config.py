@@ -120,6 +120,13 @@ class Settings:
         # models, so this only ever ships when the bench says the local stack
         # clears the gate with margin.
         self.local_only = env.get("LOCAL_ONLY", "").strip().lower() in ("1", "true", "yes")
+        # HYBRID_POLICY (Basket B, ignored when LOCAL_ONLY): "" = legacy
+        # hybrid; "h1" = insured-local (factual always-remote, logic ships
+        # only on agreement); "h2" = h1 but logic also ships its best single
+        # local candidate instead of escalating (cheaper, slightly riskier).
+        self.hybrid_policy = env.get("HYBRID_POLICY", "").strip().lower()
+        if self.hybrid_policy not in ("", "h1", "h2"):
+            self.hybrid_policy = ""
         # Per-task ceiling: 28 s keeps every remote API call comfortably under
         # the 30 s/request rule. LOCAL_ONLY makes zero API calls, so only the
         # 10-minute total binds — allow long local thinking on the hard tail

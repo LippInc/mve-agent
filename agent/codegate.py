@@ -171,14 +171,62 @@ def run_tests(code: str, tests: list, timeout: float = 6.0) -> bool:
     return out is not None and "GATE_OK" in out
 
 
+def _edge_smoke_lines(test: str) -> list:
+    """From one `assert (CALL) == (VAL)` body, derive no-crash smoke calls on
+    SINGLETON variants of list/str arguments (one example passing is thin
+    evidence; a hidden index bug like items[1] crashes on a singleton).
+    Deliberately no EMPTY variants: correct code may legitimately raise on
+    empty input, and a false gate-fail costs an escalation."""
+    m = re.search(r"assert \((.*)\) == \(", test)
+    if not m:
+        return []
+    try:
+        node = ast.parse(m.group(1), mode="eval")
+    except Exception:
+        return []
+    if not isinstance(node.body, ast.Call):
+        return []
+    lines = []
+    for i, arg in enumerate(node.body.args):
+        variant = None
+        if isinstance(arg, ast.List) and len(arg.elts) > 1:
+            variant = ast.List(elts=[arg.elts[0]], ctx=ast.Load())
+        elif (isinstance(arg, ast.Constant) and isinstance(arg.value, str)
+                and len(arg.value) > 1):
+            variant = ast.Constant(value=arg.value[0])
+        if variant is None:
+            continue
+        call = ast.Call(func=node.body.func,
+                        args=[variant if j == i else a
+                              for j, a in enumerate(node.body.args)],
+                        keywords=list(node.body.keywords))
+        try:
+            lines.append(ast.unparse(ast.fix_missing_locations(
+                ast.Expression(body=call)).body))
+        except Exception:
+            continue
+    return lines[:2]
+
+
 def gate_code(prompt: str, code: str, timeout: float = 6.0) -> tuple:
     """Return (passed, n_tests). passed is True only if >=1 prompt-derived test
     was found AND the code executes them all successfully. (False, 0) means
-    'no prompt-derived test -> unverifiable by this gate'."""
+    'no prompt-derived test -> unverifiable by this gate'. A single-example
+    pass additionally requires the no-crash edge smoke."""
     if not code or not code.strip():
         return False, 0
     func = first_func_name(code)
     tests = extract_example_tests(prompt, func=func)
     if not tests:
         return False, 0
-    return run_tests(code, tests, timeout), len(tests)
+    passed = run_tests(code, tests, timeout)
+    if passed and len(tests) == 1:
+        # nth-element semantics (second largest, kth smallest, pairs) raise
+        # legitimately on singletons — the smoke would false-fail correct
+        # code there (critic-confirmed on second_largest).
+        if not re.search(r"\b(second|third|kth|nth|pairs?|two largest"
+                         r"|top \d)", prompt, re.I):
+            smoke = _edge_smoke_lines(tests[0])
+            if smoke and not run_tests(code, smoke, timeout):
+                return False, len(tests)
+    return passed, len(tests)

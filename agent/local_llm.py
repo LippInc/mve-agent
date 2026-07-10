@@ -98,6 +98,12 @@ class LocalLLM:
                 return ""
             data = r.json()
             return (data["choices"][0]["message"].get("content") or "").strip()
+        except httpx.ConnectError:
+            # server died mid-run (e.g. an inference-time crash) -> stop trying
+            # it; remaining tasks skip straight to remote.
+            if self.proc is None or self.proc.poll() is not None:
+                self.available = False
+            return ""
         except Exception:
             return ""
 

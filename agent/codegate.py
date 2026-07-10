@@ -12,9 +12,72 @@ Pure stdlib. Everything here is best-effort and never raises to the caller.
 """
 
 import ast
+import os
 import re
 import subprocess
 import sys
+import tempfile
+
+_POSIX = os.name == "posix"
+if _POSIX:
+    import signal
+    import resource
+
+
+def _limits():
+    # Bound a child that runs model-generated code: address space, CPU seconds,
+    # process count (fork-bomb guard), file size. POSIX only.
+    os.setsid()
+    mb = 512 * 1024 * 1024
+    for res, lim in ((resource.RLIMIT_AS, mb), (resource.RLIMIT_CPU, 8),
+                     (resource.RLIMIT_FSIZE, 1 << 20), (resource.RLIMIT_NPROC, 64)):
+        try:
+            resource.setrlimit(res, (lim, lim))
+        except Exception:
+            pass
+
+
+def _exec(script: str, timeout: float) -> str:
+    """Run a Python script in a hardened, disposable subprocess. Returns stdout
+    (capped) on clean exit, or None on non-zero exit / timeout / any failure.
+    Never raises. Env is scrubbed of the API key; on POSIX the whole process
+    group is killed on timeout so orphaned grandchildren can't linger."""
+    if timeout < 0.5:
+        return None
+    env = {"PATH": os.environ.get("PATH", ""), "PYTHONIOENCODING": "utf-8"}
+    kw = dict(stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
+              cwd=tempfile.gettempdir(), env=env)
+    if _POSIX:
+        kw["preexec_fn"] = _limits
+    else:
+        kw["creationflags"] = getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+    try:
+        p = subprocess.Popen([sys.executable, "-I", "-X", "utf8", "-c", script], **kw)
+    except Exception:
+        return None
+    try:
+        out, _ = p.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        try:
+            if _POSIX:
+                os.killpg(os.getpgid(p.pid), signal.SIGKILL)
+            else:
+                p.kill()
+        except Exception:
+            pass
+        try:
+            p.communicate(timeout=1)
+        except Exception:
+            pass
+        return None
+    except Exception:
+        return None
+    if p.returncode != 0:
+        return None
+    try:
+        return (out or b"").decode("utf-8", "replace")[:65536]
+    except Exception:
+        return None
 
 # name(args) [==|=|->|returns|should return|gives|yields|outputs] value
 _CALL_EXPECT = re.compile(
@@ -90,18 +153,13 @@ def first_func_name(code: str) -> str:
 
 
 def run_tests(code: str, tests: list, timeout: float = 6.0) -> bool:
-    """Execute `code` followed by the assert lines in an isolated subprocess.
+    """Execute `code` followed by the assert lines in a hardened subprocess.
     True iff it exits cleanly with all assertions passing."""
     if not code or not code.strip() or not tests:
         return False
     script = code + "\n\n" + "\n".join(tests) + "\nprint('GATE_OK')\n"
-    try:
-        r = subprocess.run([sys.executable, "-I", "-X", "utf8", "-c", script],
-                           capture_output=True, text=True, timeout=timeout,
-                           encoding="utf-8", errors="replace")
-    except Exception:
-        return False
-    return r.returncode == 0 and "GATE_OK" in r.stdout
+    out = _exec(script, timeout)
+    return out is not None and "GATE_OK" in out
 
 
 def gate_code(prompt: str, code: str, timeout: float = 6.0) -> tuple:

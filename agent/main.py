@@ -126,14 +126,17 @@ def main() -> int:
 
     # Stage C local-inference layer (off unless LOCAL_LAYER is set). Started
     # after the insurance write so a slow model load never delays first output;
-    # fully guarded so it can never defeat the exit-0 rail.
+    # fully guarded so it can never defeat the exit-0 rail. Only spawned when we
+    # actually have a remote path to fall back on (online) — no point paying the
+    # health-wait for a layer the task loop would never reach.
     local = None
-    try:
-        from agent.local_llm import LocalLLM
-        local = LocalLLM(settings)
-    except Exception as e:
-        local = None
-        log(f"[local] init guard: {type(e).__name__} - remote only")
+    if client is not None and settings.local_layer != "off":
+        try:
+            from agent.local_llm import LocalLLM
+            local = LocalLLM(settings)
+        except Exception as e:
+            local = None
+            log(f"[local] init guard: {type(e).__name__} - remote only")
 
     deadline_global = BOOT + TOTAL_BUDGET_S
     for i, t in enumerate(tasks):

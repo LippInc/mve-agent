@@ -216,18 +216,50 @@ _SELFTEST_SUFFIX = (
 
 
 def _extract_asserts(text: str) -> list:
-    out = []
+    """Keep only well-formed, NON-DEGENERATE example asserts: `assert CALL ==
+    LITERAL`, where the right side is a plain Python literal (not another call,
+    and not a reference to the function under test). This rejects vacuous
+    self-tests like `assert f(x) == f(x)` or `assert True` that would let wrong
+    code pass its own gate."""
+    out, seen = [], set()
     for ln in (text or "").splitlines():
         ln = ln.strip().rstrip(";")
-        if ln.startswith("assert ") and "==" in ln:
+        if not (ln.startswith("assert ") and "==" in ln):
+            continue
+        body = ln[len("assert "):]
+        try:
+            node = ast.parse(body, mode="eval").body
+        except Exception:
+            continue
+        if not (isinstance(node, ast.Compare) and len(node.ops) == 1
+                and isinstance(node.ops[0], ast.Eq)):
+            continue
+        left, right = node.left, node.comparators[0]
+        if not isinstance(left, ast.Call):          # LHS must exercise the code
+            continue
+        try:
+            ast.literal_eval(right)                  # RHS must be a bare literal
+        except Exception:
+            continue
+        if ln not in seen:
+            seen.add(ln)
             out.append(ln)
     return out[:5]
+
+
+def _gate_timeout(local_deadline) -> float:
+    """Seconds a gate subprocess may run, clamped to the local budget so the
+    whole local attempt never eats into the remote-fallback margin."""
+    return max(0.0, min(6.0, local_deadline - time.monotonic()))
 
 
 def _try_local_code(local, prompt: str, category: str, deadline) -> str:
     """Generate code locally and ship it ONLY if it passes a deterministic
     gate. Returns the answer text on success, or None to fall back to remote.
-    Records zero proxy tokens on success (no Fireworks call made)."""
+    Records zero proxy tokens on success (no Fireworks call made).
+
+    The entire local attempt (generation + gates) is bounded by local_deadline,
+    which sits inside the per-task deadline so a remote fallback always fits."""
     local_deadline = min(deadline, time.monotonic() + _LOCAL_CODE_BUDGET_S)
     reply = local.chat(prompt + _CODE_LOCAL_SUFFIX[category], max_tokens=384,
                        deadline=local_deadline)
@@ -236,21 +268,39 @@ def _try_local_code(local, prompt: str, category: str, deadline) -> str:
         return None
 
     # Gate 1 (always): tests derived from the prompt's own worked examples.
-    passed, n_examples = codegate.gate_code(prompt, code)
-    if passed:
-        _log(f"[local-code] {category} shipped (example-gate, {n_examples} tests)")
-        return reply.strip()
-
-    # Gate 2 ("code+" only): model-authored self-tests. Higher hit rate, small
-    # "confidently-wrong" risk -> only enabled once accuracy margin is proven.
-    if local.mode == "code+" and n_examples == 0:
-        tset = local.chat(code + _SELFTEST_SUFFIX, max_tokens=160,
-                          deadline=min(deadline, time.monotonic() + 12.0))
-        tests = _extract_asserts(tset)
-        # require >=2 non-trivial asserts AND that they actually exercise the code
-        if len(tests) >= 2 and codegate.run_tests(code, tests):
-            _log(f"[local-code] {category} shipped (self-test gate, {len(tests)} tests)")
+    gt = _gate_timeout(local_deadline)
+    if gt >= 1.0:
+        passed, n_examples = codegate.gate_code(prompt, code, timeout=gt)
+        if passed:
+            _log(f"[local-code] {category} shipped (example-gate, {n_examples} tests)")
             return reply.strip()
+    else:
+        n_examples = len(codegate.extract_example_tests(
+            prompt, func=codegate.first_func_name(code)))
+
+    # Gate 2 ("code+" only): model-authored self-tests. Hardened against the
+    # "confidently-wrong" failure so it is safer on a zero-margin gate:
+    #   - >=3 non-degenerate asserts (LHS call == RHS literal)
+    #   - the candidate code passes all of them
+    #   - for code-debug: the ORIGINAL buggy code must FAIL >=1 test, proving the
+    #     tests actually discriminate the bug (else the tests are vacuous).
+    if (local.mode == "code+" and n_examples == 0
+            and local_deadline - time.monotonic() > 3.0):
+        tset = local.chat(code + _SELFTEST_SUFFIX, max_tokens=160,
+                          deadline=local_deadline)
+        tests = _extract_asserts(tset)
+        gt = _gate_timeout(local_deadline)
+        if len(tests) >= 3 and gt >= 1.0 and codegate.run_tests(code, tests, timeout=gt):
+            discriminates = True
+            if category == "code-debug":
+                original = codegate.extract_code(prompt)
+                gt = _gate_timeout(local_deadline)
+                # tests discriminate iff the original (buggy) code does NOT pass them
+                discriminates = (bool(original.strip()) and gt >= 1.0
+                                 and not codegate.run_tests(original, tests, timeout=gt))
+            if discriminates:
+                _log(f"[local-code] {category} shipped (self-test gate, {len(tests)} tests)")
+                return reply.strip()
 
     _log(f"[local-code] {category} unverified -> remote fallback")
     return None

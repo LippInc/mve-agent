@@ -86,13 +86,14 @@ LOCAL_SERVER_DEFAULT = "/opt/llamacpp/llama-server"
 LOCAL_MODEL_DEFAULT = "/models/model.gguf"
 LOCAL_MODEL2_DEFAULT = "/models/general.gguf"
 
-_KNOWN_FEATURES = {"code", "code+", "math", "sentiment", "ner", "sum"}
+_KNOWN_FEATURES = {"code", "code+", "math", "sentiment", "ner", "sum",
+                   "logic", "factual"}
 
 # Which features run on which model server. Coder-model features run in
 # phase 1, general-model features in phase 2 (one server lives at a time —
 # the 4 GB grading box cannot hold both models resident).
 CODER_FEATURES = {"code", "code+", "math"}
-GENERAL_FEATURES = {"sentiment", "ner", "sum"}
+GENERAL_FEATURES = {"sentiment", "ner", "sum", "logic", "factual"}
 
 
 def parse_local_features(raw: str) -> frozenset:
@@ -113,6 +114,17 @@ class Settings:
 
         self.local_layer = env.get("LOCAL_LAYER", LOCAL_LAYER_DEFAULT).strip().lower()
         self.local_features = parse_local_features(self.local_layer)
+        # LOCAL_ONLY=1: the zero-proxy-token play. NEVER call the remote API —
+        # ship the best local answer (verified path first, raw fallback second).
+        # The token score is exactly 0; accuracy rides entirely on the bundled
+        # models, so this only ever ships when the bench says the local stack
+        # clears the gate with margin.
+        self.local_only = env.get("LOCAL_ONLY", "").strip().lower() in ("1", "true", "yes")
+        # Per-task ceiling: 28 s keeps every remote API call comfortably under
+        # the 30 s/request rule. LOCAL_ONLY makes zero API calls, so only the
+        # 10-minute total binds — allow long local thinking on the hard tail
+        # (the global watchdog + fair-share budgeting still bound the total).
+        self.per_task_cap_s = 75.0 if self.local_only else PER_TASK_CAP_S
         self.local_server = env.get("LOCAL_SERVER", LOCAL_SERVER_DEFAULT).strip()
         self.local_model = env.get("LOCAL_MODEL", LOCAL_MODEL_DEFAULT).strip()
         self.local_model2 = env.get("LOCAL_MODEL2", LOCAL_MODEL2_DEFAULT).strip()

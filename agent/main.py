@@ -109,13 +109,15 @@ def main() -> int:
 
     client = None
     ladder = []
+    pipelines = None
     if settings.online:
         # Deferred import keeps boot instant even if httpx grows deps later.
         # Guarded so a broken import/init can never defeat the exit-0 rail:
         # on any failure we ship the fallback answers already on disk.
         try:
             from agent.fw import FireworksClient
-            from agent import pipelines
+            from agent import pipelines as _pl
+            pipelines = _pl
             client = FireworksClient(settings)
             ladder = list(settings.models)
         except Exception as e:
@@ -123,6 +125,16 @@ def main() -> int:
             log(f"[init-error] {type(e).__name__} - shipping fallback answers")
     else:
         log("[offline] missing env config - shipping fallback answers")
+    if pipelines is None and settings.local_only:
+        # LOCAL_ONLY needs no remote path at all - load the pipeline anyway.
+        try:
+            from agent import pipelines as _pl
+            pipelines = _pl
+        except Exception as e:
+            log(f"[init-error] {type(e).__name__} (local-only)")
+
+    # A run is workable with a remote client OR in local-only mode.
+    runnable = pipelines is not None and (client is not None or settings.local_only)
 
     # Local-inference layer (off unless LOCAL_LAYER is set). Two model roles,
     # one server alive at a time (4 GB box): tasks are processed in two phases
@@ -131,7 +143,7 @@ def main() -> int:
     # only spawned when we actually have a remote path to fall back on.
     local = None
     coder_needed = general_needed = False
-    if client is not None and settings.local_features:
+    if runnable and settings.local_features:
         try:
             from agent.config import CODER_FEATURES, GENERAL_FEATURES
             coder_needed = bool(settings.local_features & CODER_FEATURES)
@@ -141,8 +153,12 @@ def main() -> int:
 
     # Phase order: coder-category tasks first, original order inside each
     # phase. Output order is unaffected (results keyed by task_id).
-    CODER_CATS = ("code-debug", "code-gen", "math")
-    if client is not None:
+    # In LOCAL_ONLY, math rides the GENERAL phase: the bigger instruct model
+    # is the stronger word-problem reasoner and there is no remote to catch
+    # coder slips (measured: coder-PoT 5/7 vs general-model target 7/7).
+    CODER_CATS = (("code-debug", "code-gen") if settings.local_only
+                  else ("code-debug", "code-gen", "math"))
+    if runnable:
         try:
             from agent.categories import detect
             for t in tasks:
@@ -163,13 +179,13 @@ def main() -> int:
             log(f"[local] init guard ({role}): {type(e).__name__} - remote only")
             return None
 
-    if client is not None and coder_needed:
+    if runnable and coder_needed:
         local = start_local("coder")
 
     deadline_global = BOOT + TOTAL_BUDGET_S
     general_started = False
     for i, t in enumerate(tasks):
-        if client is None:
+        if not runnable:
             break
         # Phase boundary: first non-coder-category task -> swap servers.
         if (general_needed and not general_started
@@ -184,14 +200,18 @@ def main() -> int:
         if remaining < PER_TASK_FLOOR_S:
             log(f"[watchdog] global budget exhausted at task {i + 1}/{len(tasks)}")
             break
-        budget = min(PER_TASK_CAP_S, max(PER_TASK_FLOOR_S, 0.9 * remaining / n_left))
+        budget = min(settings.per_task_cap_s,
+                     max(PER_TASK_FLOOR_S, 0.9 * remaining / n_left))
         try:
-            current = pipelines.order_ladder(client, ladder)
-            if not current:
-                log("[watchdog] no models left alive")
-                break
+            current = []
+            if client is not None:
+                current = pipelines.order_ladder(client, ladder)
+                if not current and not settings.local_only:
+                    log("[watchdog] no models left alive")
+                    break
             ans = pipelines.answer_task(client, current, t["prompt"], now + budget,
-                                        local=local, category=t.get("category"))
+                                        local=local, category=t.get("category"),
+                                        local_only=settings.local_only)
             if ans:
                 answers[t["task_id"]] = str(ans)
         except Exception as e:  # per-task isolation: one bad task never kills the run

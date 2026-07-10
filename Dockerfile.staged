@@ -47,10 +47,14 @@ COPY vendor/models/general.gguf /models/general.gguf
 COPY agent/ ./agent/
 
 ARG LOCAL_FLAGS="code+,math,sentiment,ner"
+# Set LOCAL_ONLY_MODE=1 to build the zero-proxy-token variant (never calls
+# the remote API; accuracy rides entirely on the bundled models).
+ARG LOCAL_ONLY_MODE=""
 
 # The graded harness injects only FIREWORKS_*/ALLOWED_MODELS, never LOCAL_*,
 # so these ENVs are what grades.
 ENV LOCAL_LAYER=${LOCAL_FLAGS} \
+    LOCAL_ONLY=${LOCAL_ONLY_MODE} \
     LOCAL_SERVER=/opt/llamacpp/llama-server \
     LOCAL_MODEL=/models/model.gguf \
     LOCAL_MODEL2=/models/general.gguf \

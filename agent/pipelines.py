@@ -120,6 +120,7 @@ def _extract_expression(text: str) -> str:
 
 
 _MONEY_RX = re.compile(r"\$|dollars?|cents?|euros?|price|cost|owes?|pay|change")
+_COUNT_Q_RX = re.compile(r"how many|number of|count of", re.I)
 
 
 def _format_number(value, prompt: str = "") -> str:
@@ -259,7 +260,8 @@ def _gate_timeout(local_deadline) -> float:
     return max(0.0, min(6.0, local_deadline - time.monotonic()))
 
 
-def _try_local_code(local, prompt: str, category: str, deadline) -> str:
+def _try_local_code(local, prompt: str, category: str, deadline,
+                    ship_unverified: bool = False) -> str:
     """Generate code locally and ship it ONLY if it passes a deterministic
     gate. Returns the answer text on success, or None to fall back to remote.
     Records zero proxy tokens on success (no Fireworks call made).
@@ -314,6 +316,9 @@ def _try_local_code(local, prompt: str, category: str, deadline) -> str:
                 _log(f"[local-code] {category} shipped (self-test gate, {len(tests)} tests)")
                 return reply.strip()
 
+    if ship_unverified and reply.strip():
+        _log(f"[local-code] {category} unverified but LOCAL_ONLY - shipped raw")
+        return reply.strip()
     _log(f"[local-code] {category} unverified -> remote fallback")
     return None
 
@@ -345,25 +350,124 @@ def _eval_expression(reply: str):
     return value if isinstance(value, (int, float)) else None
 
 
-def _try_local_math(local, prompt: str, deadline) -> str:
+def _num_close(a, b) -> bool:
+    return abs(float(a) - float(b)) <= 1e-9 * max(1.0, abs(float(b)))
+
+
+# Program-of-Thought, program form: single expressions cannot express "solve
+# a system" or "brute-force the assignment" — a tiny printed-answer program
+# can, and small models write brute-force loops far more reliably than they
+# do mental algebra. Executed in codegate's hardened sandbox.
+_POT_PROG_SUFFIX = (
+    "\n\nWrite a short Python program that computes the answer and prints "
+    "ONLY the final answer (no labels, no explanation). Use plain Python "
+    "(math/itertools allowed, no input(), no files, no network). Output only "
+    "the code."
+)
+
+
+_COMPUTED_RX = re.compile(r"\bfor\b|\bwhile\b|\bif\b|itertools|range\(")
+
+
+def _pot_program_answer(local, prompt: str, deadline):
+    """Model writes a tiny program; we run it sandboxed. Returns
+    (last_stdout_line, computed) or (None, False). `computed` is True when
+    the program actually computes (loops/branches) rather than just printing
+    a belief — a computed answer is stronger evidence than a terse reply."""
+    if deadline - time.monotonic() < 3.0:
+        return None, False
+    reply = local.chat(prompt + _POT_PROG_SUFFIX, max_tokens=288,
+                       deadline=deadline)
+    code = codegate.extract_code(reply)
+    if not code.strip() or len(code) > 2400 or "input(" in code:
+        return None, False
+    out = codegate.run_capture(code, timeout=min(6.0, max(1.0, deadline - time.monotonic())))
+    if not out or not out.strip():
+        return None, False
+    return out.strip().splitlines()[-1].strip(), bool(_COMPUTED_RX.search(code))
+
+
+def _try_local_math(local, prompt: str, deadline, local_only: bool = False) -> str:
     """Independently-framed local PoT derivations; ship as soon as any two
     evaluate to the same number (2-of-3). Different phrasings decorrelate
     surface slips; a residual correlated setup error is the accepted
-    (bench-measured) risk."""
-    local_deadline = min(deadline, time.monotonic() + _LOCAL_MATH_BUDGET_S)
+    (bench-measured) risk. In LOCAL_ONLY a bounded CoT pass joins as a
+    tiebreaker, and the best single candidate ships rather than nothing."""
+    budget = 26.0 if local_only else _LOCAL_MATH_BUDGET_S
+    local_deadline = min(deadline, time.monotonic() + budget)
+
+    def _guard(v):
+        # A negative answer to a "how many/number of" question is always
+        # wrong (measured: two derivations agreeing on a sign-slip -8).
+        if v is not None and float(v) < 0 and _COUNT_Q_RX.search(prompt):
+            _log("[local-math] negative count rejected")
+            return None
+        return v
+
+    def _expr_derivation(suffix):
+        return _guard(_eval_expression(local.chat(prompt + suffix, max_tokens=64,
+                                                  deadline=local_deadline)))
+
+    def _prog_derivation():
+        ans, _ = _pot_program_answer(local, prompt, local_deadline)
+        m = _NUM_IN_TEXT_RX.search(ans or "")
+        if not m:
+            return None
+        try:
+            return _guard(float(m.group(0).replace(",", "")))
+        except ValueError:
+            return None
+
+    # Method diversity first: an expression and an executed program agreeing
+    # is stronger evidence than two same-method samples (mental-algebra slips
+    # correlate; expression-vs-program errors don't).
+    derivations = [lambda: _expr_derivation(_MATH_POT_SUFFIX),
+                   _prog_derivation,
+                   lambda: _expr_derivation(_MATH_POT_SUFFIX2)]
+    if local_only:
+        derivations.append(lambda: _expr_derivation(_MATH_POT_SUFFIX3))
+
     values = []
-    for suffix in (_MATH_POT_SUFFIX, _MATH_POT_SUFFIX2, _MATH_POT_SUFFIX3):
+    for derive in derivations:
         if local_deadline - time.monotonic() < 1.5:
             break
-        v = _eval_expression(local.chat(prompt + suffix, max_tokens=64,
-                                        deadline=local_deadline))
+        v = derive()
         if v is None:
             continue
         for prev in values:
-            if abs(float(prev) - float(v)) <= 1e-9 * max(1.0, abs(float(v))):
+            if _num_close(prev, v):
                 _log("[local-math] two derivations agree - shipped local")
                 return _format_number(v, prompt)
         values.append(v)
+    if local_only:
+        # Hard tail: spend a real thinking budget — local tokens are free,
+        # only time is budgeted (bounded by the caller's per-task deadline
+        # and the global watchdog; total runtime is the binding contract
+        # limit, not per-task time).
+        think_deadline = min(deadline, time.monotonic() + 70.0)
+        cot_v = None
+        if think_deadline - time.monotonic() > 8.0:
+            reply = local.chat(prompt + _MATH_COT_SUFFIX, max_tokens=704,
+                               deadline=think_deadline)
+            m = _NUM_IN_TEXT_RX.search(_extract_final_answer(reply))
+            if m:
+                try:
+                    cot_v = _guard(float(m.group(0).replace(",", "")))
+                except ValueError:
+                    cot_v = None
+        if cot_v is not None:
+            for prev in values:
+                if _num_close(prev, cot_v):
+                    _log("[local-math] thinking pass confirms a derivation - shipped local")
+                    return _format_number(prev, prompt)
+        if values:
+            # no agreement: terse-first single (measured better than
+            # CoT-preference on the borderline set)
+            _log("[local-math] no agreement, LOCAL_ONLY - shipped terse single")
+            return _format_number(values[0], prompt)
+        if cot_v is not None:
+            _log("[local-math] only the thinking pass produced a number - shipped")
+            return _format_number(cot_v, prompt)
     _log("[local-math] no two derivations agree -> remote")
     return None
 
@@ -425,6 +529,112 @@ def _try_local_ner(local, prompt: str, deadline) -> str:
     return None
 
 
+_SHORT_ANSWER_SUFFIXES = (
+    "\n\nGive only the final answer, no explanation.",
+    "\n\nAnswer with just the final answer and nothing else.",
+    "\n\nState the final answer alone, without reasoning or commentary.",
+)
+
+# Bounded local chain-of-thought: in LOCAL_ONLY, tokens are free and only
+# time is budgeted, so a thinking pass is a legitimate extra derivation for
+# the hard reasoning tail (math word problems, logic puzzles).
+_COT_SHORT_SUFFIX = (
+    "\n\nThink through this step by step briefly, then give only the final "
+    "answer on the last line in the form: ANSWER: <answer>"
+)
+_MATH_COT_SUFFIX = (
+    "\n\nSolve this step by step briefly, then give only the final numeric "
+    "answer on the last line in the form: ANSWER: <number>"
+)
+_ANSWER_LINE_RX = re.compile(r"answer\s*[:=]\s*(.+)", re.I)
+_NUM_IN_TEXT_RX = re.compile(r"-?\d[\d,]*(?:\.\d+)?")
+
+
+def _extract_final_answer(text: str) -> str:
+    for ln in reversed((text or "").splitlines()):
+        m = _ANSWER_LINE_RX.search(ln)
+        if m:
+            return m.group(1).strip()
+    return ""
+
+
+def _norm_short(text: str) -> str:
+    t = re.sub(r"\s+", " ", (text or "").strip().strip("\"'`")).rstrip(".!")
+    t = re.sub(r"^(the|a|an)\s+", "", t, flags=re.I)
+    return t.casefold()
+
+
+def _try_local_short_agree(local, prompt: str, deadline, tag: str,
+                           max_words: int = 8, local_only: bool = False) -> str:
+    """2-of-3 agreement on a short final answer (logic / factual). Long or
+    rambling replies never count as agreement evidence — a short exact match
+    across independently-framed asks is the confidence signal. In LOCAL_ONLY
+    a bounded CoT pass joins as a tiebreaker and the best single candidate
+    ships rather than nothing."""
+    budget = 26.0 if local_only else _LOCAL_NLP_BUDGET_S
+    local_deadline = min(deadline, time.monotonic() + budget)
+
+    def _terse(suffix):
+        return local.chat(prompt + suffix, max_tokens=32,
+                          deadline=local_deadline), False
+
+    # Method diversity: a brute-force program's printed answer agreeing with
+    # a terse reply is stronger evidence than two terse replies (a model's
+    # wrong belief repeats across framings — measured on the pet-puzzle task —
+    # but doesn't survive execution). A COMPUTED program answer also vetoes a
+    # terse-terse agreement that contradicts it.
+    samples = [lambda: _terse(_SHORT_ANSWER_SUFFIXES[0]),
+               lambda: _pot_program_answer(local, prompt, local_deadline),
+               lambda: _terse(_SHORT_ANSWER_SUFFIXES[1]),
+               lambda: _terse(_SHORT_ANSWER_SUFFIXES[2])]
+
+    seen = []          # (norm, reply, computed)
+    computed_norm = None
+    for sample in samples:
+        if local_deadline - time.monotonic() < 1.5:
+            break
+        reply, computed = sample()
+        norm = _norm_short(reply)
+        if not norm or len(norm.split()) > max_words:
+            continue
+        if computed and computed_norm is None:
+            computed_norm = norm
+        for prev_norm, prev_reply, prev_computed in seen:
+            if prev_norm != norm:
+                continue
+            if (computed_norm is not None and norm != computed_norm
+                    and not (computed or prev_computed)):
+                _log(f"[{tag}] terse agreement vetoed by computed answer")
+                continue
+            _log(f"[{tag}] two samples agree - shipped local")
+            return prev_reply.strip().strip("\"'`")
+        seen.append((norm, reply, computed))
+    cot_ans = ""
+    if local_only:
+        think_deadline = min(deadline, time.monotonic() + 70.0)
+        if think_deadline - time.monotonic() > 8.0:
+            reply = local.chat(prompt + _COT_SHORT_SUFFIX, max_tokens=704,
+                               deadline=think_deadline)
+            cot_ans = _extract_final_answer(reply)
+            norm = _norm_short(cot_ans)
+            if norm and len(norm.split()) <= max_words:
+                for prev_norm, prev_reply, _pc in seen:
+                    if prev_norm == norm:
+                        _log(f"[{tag}] thinking pass confirms a sample - shipped local")
+                        return prev_reply.strip().strip("\"'`")
+            else:
+                cot_ans = ""
+    if local_only and (cot_ans or seen):
+        computed = [r for _n, r, c in seen if c]
+        best = computed[0] if computed else (seen[0][1] if seen else cot_ans)
+        if not best:
+            best = cot_ans
+        _log(f"[{tag}] no agreement, LOCAL_ONLY - shipped best single")
+        return best.strip().strip("\"'`")
+    _log(f"[{tag}] no short-answer agreement -> remote")
+    return None
+
+
 def _try_local_sum(local, prompt: str, deadline) -> str:
     """Local summaries ship ONLY when the task states a whole-answer word
     limit we can verify deterministically; unconstrained summaries have no
@@ -457,32 +667,68 @@ def _try_local_sum(local, prompt: str, deadline) -> str:
     return None
 
 
-def _try_local(local, category: str, prompt: str, deadline) -> str:
+def _try_local(local, category: str, prompt: str, deadline,
+               local_only: bool = False) -> str:
     """Dispatch to the verified local path for this category, if the active
     server's role and the enabled feature set cover it. None -> remote."""
     if local is None or not local.available:
         return None
     feats = local.features
     if category in ("code-debug", "code-gen") and local.mode != "off":
-        return _try_local_code(local, prompt, category, deadline)
+        return _try_local_code(local, prompt, category, deadline,
+                               ship_unverified=local_only)
     if local.role == "coder":
         if category == "math" and "math" in feats:
-            return _try_local_math(local, prompt, deadline)
+            return _try_local_math(local, prompt, deadline, local_only=local_only)
         return None
     # general model phase
+    if category == "math" and "math" in feats and local_only:
+        # LOCAL_ONLY phases math onto the general model (stronger reasoner).
+        return _try_local_math(local, prompt, deadline, local_only=True)
     if category == "sentiment" and "sentiment" in feats:
         return _try_local_sentiment(local, prompt, deadline)
     if category == "ner" and "ner" in feats:
         return _try_local_ner(local, prompt, deadline)
     if category == "summarization" and "sum" in feats:
         return _try_local_sum(local, prompt, deadline)
+    if category == "logic" and "logic" in feats:
+        return _try_local_short_agree(local, prompt, deadline, "local-logic",
+                                      local_only=local_only)
+    if category == "factual" and "factual" in feats:
+        return _try_local_short_agree(local, prompt, deadline, "local-factual",
+                                      local_only=local_only)
     return None
 
 
 # ---------------- entry point ----------------
 
+def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
+    """LOCAL_ONLY last resort: the best unverified local answer. Zero proxy
+    tokens is the whole point of that mode; an unverified local answer beats
+    a static fallback string."""
+    if local is None or not local.available:
+        return ""
+    local_deadline = min(deadline, time.monotonic() + 70.0)
+    if category in ("math", "logic", "factual"):
+        # Reasoning tail: think, then extract the answer line. NEVER reuse the
+        # remote-tuned tiny caps here — a local model's preamble would truncate
+        # into garbage (measured: math answers chopped at 16 tokens).
+        reply = local.chat(prompt + _COT_SHORT_SUFFIX, max_tokens=704,
+                           deadline=local_deadline)
+        ans = _extract_final_answer(reply)
+        if ans:
+            _log(f"[local-raw] {category} thinking answer shipped")
+            return ans
+    reply = local.chat(prompt + spec["suffix"],
+                       max_tokens=max(spec["max_tokens"], 96),
+                       deadline=local_deadline)
+    if reply:
+        _log(f"[local-raw] {category} raw local answer shipped")
+    return (reply or "").strip()
+
+
 def answer_task(client, ladder, prompt: str, deadline, local=None,
-                category: str = None) -> str:
+                category: str = None, local_only: bool = False) -> str:
     """Route, shape, verify. Returns the answer text or "" when nothing
     succeeded (caller applies the static fallback)."""
     if category is None:
@@ -490,9 +736,13 @@ def answer_task(client, ladder, prompt: str, deadline, local=None,
     spec = spec_for(category)
     _log(f"[route] category={category} cap={spec['max_tokens']}")
 
-    ans = _try_local(local, category, prompt, deadline)
+    ans = _try_local(local, category, prompt, deadline, local_only=local_only)
     if ans:
         return ans  # verified locally -> zero proxy tokens
+
+    if local_only:
+        # NEVER call remote in this mode - the token score must stay 0.
+        return _local_raw(local, category, prompt, deadline, spec)
 
     if category == "math":
         return _math_task(client, ladder, prompt, deadline)

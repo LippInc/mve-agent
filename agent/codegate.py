@@ -152,6 +152,15 @@ def first_func_name(code: str) -> str:
     return m.group(1) if m else None
 
 
+def run_capture(code: str, timeout: float = 6.0) -> str:
+    """Execute a small model-authored program in the hardened subprocess and
+    return its stdout, or None on any failure/timeout. Same sandbox as the
+    test gate (rlimits, scrubbed env, isolated interpreter)."""
+    if not code or not code.strip():
+        return None
+    return _exec(code, timeout)
+
+
 def run_tests(code: str, tests: list, timeout: float = 6.0) -> bool:
     """Execute `code` followed by the assert lines in a hardened subprocess.
     True iff it exits cleanly with all assertions passing."""

@@ -196,7 +196,35 @@ def _word_count(text: str) -> int:
 _PER_ITEM_RX = re.compile(r"\beach\b|\bper\s+(bullet|point|item|line|entity|sentence)\b", re.I)
 
 
+def _logic_think_task(client, ladder, prompt: str, deadline) -> str:
+    """h3's logic escalation: one remote call with reasoning ENABLED (no
+    thinking-disable param) and a cap that fits the chain of thought.
+    Measured 2026-07-11 on the 6 fresh puzzles terse-m3 failed: thinking-m3
+    went 6/6 at ~522 total tokens/task, so the reasoning bill is the price
+    of actually solving the puzzle - a terse escalation is a coin flip."""
+    for model in list(ladder)[:2]:
+        if model in client.dead_models:
+            continue
+        res = client.chat(
+            model,
+            [{"role": "user", "content": prompt + spec_for("logic")["suffix"]}],
+            deadline,
+            max_tokens=1024,
+            expect_reasoning=True,
+        )
+        if res.ok and res.content.strip():
+            return res.content.strip()
+        if deadline - time.monotonic() < 2.0:
+            break
+    return ""
+
+
 def _summarization_task(client, ladder, prompt: str, deadline, spec) -> str:
+    # Remote completions get double the spec cap: a summary truncated at the
+    # cap is a guaranteed judge-fail (fresh-corpus 2026-07-11: a 4-bullet
+    # complete-sentence ask cut mid-bullet at exactly 112), and the extra
+    # ceiling only bills when the format genuinely needs the length.
+    cap = max(spec["max_tokens"], 224)
     m = _WORD_LIMIT_RX.search(prompt)
     # A per-item limit ("3 bullets, each under 8 words") must NOT be verified
     # against the whole answer — the compress-retry would destroy a correct
@@ -206,15 +234,14 @@ def _summarization_task(client, ladder, prompt: str, deadline, spec) -> str:
     # at most 8 words" while still excluding passage-embedded "each".
     clause = prompt[max(0, m.start() - 90): m.end() + 48] if m else ""
     if not m or _PER_ITEM_RX.search(clause):
-        return _call(client, ladder, prompt + spec["suffix"], deadline,
-                     spec["max_tokens"])
+        return _call(client, ladder, prompt + spec["suffix"], deadline, cap)
     limit = _word_limit(m)
     target = max(5, (limit * 7) // 10)  # models overshoot; aim well under
     draft = _call(
         client, ladder,
         prompt + f"\n\nOutput only the summary, in at most {target} words. "
                  f"Never exceed {limit} words.",
-        deadline, spec["max_tokens"])
+        deadline, cap)
     if not draft or _word_count(draft) <= limit:
         return draft
     _log(f"[sumlen] draft {_word_count(draft)} words > limit {limit} - compressing")
@@ -222,7 +249,7 @@ def _summarization_task(client, ladder, prompt: str, deadline, spec) -> str:
         client, ladder,
         f"Shorten this to at most {target} words, keeping the meaning and "
         f"format. Output only the result.\n\n{draft}",
-        deadline, spec["max_tokens"])
+        deadline, cap)
     if shorter and _word_count(shorter) <= limit:
         return shorter
     return shorter or draft
@@ -990,6 +1017,12 @@ def answer_task(client, ladder, prompt: str, deadline, local=None,
         return _math_task(client, ladder, prompt, deadline)
     if category == "summarization":
         return _summarization_task(client, ladder, prompt, deadline, spec)
+    if category == "logic" and hybrid_policy == "h3":
+        ans = _logic_think_task(client, ladder, prompt, deadline)
+        if ans:
+            return _unsmash_names(ans)
+        # thinking escalation produced nothing (dead ladder / out of time):
+        # fall through to the terse shape as the last remote resort
     return _call(client, ladder, prompt + spec["suffix"], deadline,
                  spec["max_tokens"])
 

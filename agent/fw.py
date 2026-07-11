@@ -61,7 +61,8 @@ class FireworksClient:
         return self.leak_strikes.get(model, 0) >= 2
 
     def chat(self, model, messages, deadline, max_tokens=512, temperature=0.0,
-             stop=None, thinking=None, response_format=None) -> CallResult:
+             stop=None, thinking=None, response_format=None,
+             expect_reasoning=False) -> CallResult:
         """One chat completion bounded by an absolute time.monotonic deadline.
         Retries transient failures with backoff while time remains; strips
         optional params once on a 400 that names them."""
@@ -111,7 +112,7 @@ class FireworksClient:
             if r.status_code == 200:
                 if body["model"] != model:
                     self.model_form[model] = body["model"]
-                return self._handle_200(r, model, elapsed)
+                return self._handle_200(r, model, elapsed, expect_reasoning)
             if r.status_code in (400, 404, 422):
                 tl = r.text[:500].lower()
                 # 1) Strip only the optional param the error actually names.
@@ -156,7 +157,7 @@ class FireworksClient:
         if pause > 0:
             time.sleep(pause)
 
-    def _handle_200(self, r, model, elapsed) -> CallResult:
+    def _handle_200(self, r, model, elapsed, expect_reasoning=False) -> CallResult:
         try:
             data = r.json()
             msg = data["choices"][0]["message"]
@@ -184,8 +185,11 @@ class FireworksClient:
             f"total={t} visible~{vis}")
         # Leak detection on the VISIBLE content (before the reasoning fallback),
         # so a mandatory-thinking model (empty content, huge completion) is still
-        # correctly flagged as billing hidden reasoning.
-        if c > max(3 * vis, vis + 100):
+        # correctly flagged as billing hidden reasoning. Calls that DELIBERATELY
+        # buy reasoning (h3 logic escalation) are exempt - their token bill is
+        # priced in, and a strike here would wrongly demote the model for every
+        # later terse call.
+        if not expect_reasoning and c > max(3 * vis, vis + 100):
             self.leak_strikes[model] = self.leak_strikes.get(model, 0) + 1
             log(f"[leak-suspect] model={model} strikes={self.leak_strikes[model]} "
                 f"completion={c} visible~{vis}")

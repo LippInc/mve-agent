@@ -123,9 +123,13 @@ class Settings:
         # HYBRID_POLICY (Basket B, ignored when LOCAL_ONLY): "" = legacy
         # hybrid; "h1" = insured-local (factual always-remote, logic ships
         # only on agreement); "h2" = h1 but logic also ships its best single
-        # local candidate instead of escalating (cheaper, slightly riskier).
+        # local candidate instead of escalating (cheaper, slightly riskier);
+        # "h3" = h2 everywhere except logic, whose escalation runs
+        # thinking-ENABLED (fresh-puzzle probe 2026-07-11: m3 terse 0/6 vs
+        # m3 thinking 6/6 @ ~522 tok/task - the suppression, not the model,
+        # was the fresh-logic failure).
         self.hybrid_policy = env.get("HYBRID_POLICY", "").strip().lower()
-        if self.hybrid_policy not in ("", "h1", "h2"):
+        if self.hybrid_policy not in ("", "h1", "h2", "h3"):
             self.hybrid_policy = ""
         # Per-task ceiling: 28 s keeps every remote API call comfortably under
         # the 30 s/request rule. LOCAL_ONLY makes zero API calls, so only the

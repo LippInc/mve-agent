@@ -144,7 +144,10 @@ SPECS = {
     },
     "factual": {
         "suffix": "\n\nAnswer in 1-2 short sentences.",
-        "max_tokens": 72,
+        # 128 not 72: factual is always-remote with no truncation repair, and
+        # two-part questions ("name X and explain why") need the headroom.
+        # Models stop when done, so the wider cap costs ~nothing typically.
+        "max_tokens": 128,
     },
     "code-gen": {
         "suffix": "\n\nPython code only, no explanation.",

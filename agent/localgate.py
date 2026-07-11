@@ -41,14 +41,18 @@ def sentiment_agree(reply_a: str, reply_b: str):
 _ENTITY_LINE_RX = re.compile(r"^\s*(?:[-*•]\s*)?(.+?)\s*(?:-|–|—|:)\s*([A-Za-z ]{2,24})\s*$")
 
 _TYPE_NORM = {
-    "person": "person", "people": "person", "per": "person", "name": "person",
-    "organization": "organization", "organisation": "organization",
-    "org": "organization", "company": "organization", "agency": "organization",
-    "location": "location", "place": "location", "loc": "location",
-    "gpe": "location", "city": "location", "country": "location",
-    "date": "date", "time": "date", "year": "date",
-    "money": "money", "monetary": "money", "monetary amount": "money",
-    "amount": "money", "currency": "money", "price": "money",
+    # Canonical labels are UPPERCASE: NER prompts request the label set as
+    # PERSON/ORGANIZATION/LOCATION/DATE, and label text is part of the graded
+    # answer ("required format"). Only rendering changes — every comparison
+    # goes through this same normalization.
+    "person": "PERSON", "people": "PERSON", "per": "PERSON", "name": "PERSON",
+    "organization": "ORGANIZATION", "organisation": "ORGANIZATION",
+    "org": "ORGANIZATION", "company": "ORGANIZATION", "agency": "ORGANIZATION",
+    "location": "LOCATION", "place": "LOCATION", "loc": "LOCATION",
+    "gpe": "LOCATION", "city": "LOCATION", "country": "LOCATION",
+    "date": "DATE", "time": "DATE", "year": "DATE",
+    "money": "MONEY", "monetary": "MONEY", "monetary amount": "MONEY",
+    "amount": "MONEY", "currency": "MONEY", "price": "MONEY",
 }
 
 

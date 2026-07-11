@@ -221,8 +221,10 @@ def main() -> int:
             if client is not None:
                 current = pipelines.order_ladder(client, ladder)
                 if not current and not settings.local_only:
-                    log("[watchdog] no models left alive")
-                    break
+                    # Dead ladder must not end the run: the verified-local
+                    # paths need no remote model, so keep serving tasks and
+                    # let only the remote-dependent ones fall back.
+                    log("[watchdog] ladder empty - continuing verified-local only")
             ans = pipelines.answer_task(client, current, t["prompt"], now + budget,
                                         local=local, category=t.get("category"),
                                         local_only=settings.local_only,

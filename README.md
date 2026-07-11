@@ -43,7 +43,7 @@ build args. the submitted image is the hybrid build.
 ## docker image
 
 ```
-ghcr.io/lippinc/mve-agent:final3
+ghcr.io/lippinc/mve-agent:final4
 ```
 
 ## how it runs
@@ -55,7 +55,7 @@ docker run --rm \
   -e FIREWORKS_API_KEY=... \
   -e FIREWORKS_BASE_URL=... \
   -e ALLOWED_MODELS=... \
-  ghcr.io/lippinc/mve-agent:final3
+  ghcr.io/lippinc/mve-agent:final4
 ```
 
 all configuration comes from the environment. no keys or answers are baked

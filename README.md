@@ -21,10 +21,14 @@ pass deterministic verification before shipping.
   an arithmetic expression *and* a tiny program; the container evaluates both
   locally and ships only on cross-method agreement. code ships only after
   passing execution self-tests in a hardened sandbox. NER entities are
-  verified verbatim-in-source; summaries are word-limit-verified; logic
-  puzzles are brute-forced by generated constraint-enumeration programs.
-  unverifiable answers fall back to the best available sample — never an
-  empty answer.
+  verified verbatim-in-source; summaries are format-verified against the
+  task's stated constraints (word limits, sentence counts, bullet counts,
+  per-bullet word caps — deterministically enforced) and regenerated once
+  when they drop the passage's key figures; logic puzzles are brute-forced
+  by generated constraint-enumeration programs; two-sided reviews are
+  labeled mixed only after two independent confirmations. unverifiable
+  answers fall back to the best available sample — never an empty answer
+  (a deterministic extractive summary is the summarization floor).
 - **offline factual grounding**: factual questions retrieve passages from a
   bundled Simple English Wikipedia full-text index (sqlite FTS5/BM25, built
   at image-build time). the model drafts, the draft's entities steer the
@@ -48,7 +52,7 @@ zero-token local build; earlier submissions from this repo were the hybrid.
 ## docker image
 
 ```
-ghcr.io/lippinc/mve-agent:final6
+ghcr.io/lippinc/mve-agent:final7
 ```
 
 ## how it runs
@@ -60,7 +64,7 @@ docker run --rm \
   -e FIREWORKS_API_KEY=... \
   -e FIREWORKS_BASE_URL=... \
   -e ALLOWED_MODELS=... \
-  ghcr.io/lippinc/mve-agent:final6
+  ghcr.io/lippinc/mve-agent:final7
 ```
 
 all configuration comes from the environment. no keys or answers are baked

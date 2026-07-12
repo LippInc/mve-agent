@@ -15,6 +15,7 @@ manager reports `available=False`/returns "" and the agent falls back to the
 remote pipeline. It can never make the container worse than remote-only.
 """
 
+import json
 import os
 import subprocess
 import sys
@@ -98,30 +99,54 @@ class LocalLLM:
     def chat(self, prompt: str, max_tokens: int, deadline: float,
              temperature: float = 0.0) -> str:
         """One local completion bounded by an absolute time.monotonic deadline.
-        Returns "" on any failure (caller falls back to remote)."""
+        Returns "" (or the partial text) on any failure.
+
+        STREAMING on purpose: a non-streaming call that hits the client
+        timeout leaves llama-server generating the full completion on its
+        single slot, wedging every follow-up call — observed as empty
+        answers (fresh-124: 3 logic tasks whose grace retries all queued
+        behind a dead 704-token CoT) and, at 2 vCPU where generation is
+        minutes-slow, a poisoned-task cascade. Closing the stream aborts
+        the server-side generation within a token."""
         if not self.available:
             return ""
         budget = deadline - time.monotonic()
         if budget < 1.0:
             return ""
+        parts = []
         try:
-            r = self._client.post(
-                f"{self.base}/v1/chat/completions",
-                json={"messages": [{"role": "user", "content": prompt}],
-                      "max_tokens": max_tokens, "temperature": temperature},
-                timeout=httpx.Timeout(min(budget, 28.0), connect=2.0))
-            if r.status_code != 200:
-                return ""
-            data = r.json()
-            return (data["choices"][0]["message"].get("content") or "").strip()
+            with self._client.stream(
+                    "POST", f"{self.base}/v1/chat/completions",
+                    json={"messages": [{"role": "user", "content": prompt}],
+                          "max_tokens": max_tokens,
+                          "temperature": temperature,
+                          "stream": True},
+                    timeout=httpx.Timeout(min(budget, 28.0), connect=2.0)) as r:
+                if r.status_code != 200:
+                    return ""
+                for line in r.iter_lines():
+                    if time.monotonic() > deadline:
+                        break  # exit the with-block -> server aborts
+                    if not line or not line.startswith("data: "):
+                        continue
+                    payload = line[6:].strip()
+                    if payload == "[DONE]":
+                        break
+                    try:
+                        delta = json.loads(payload)["choices"][0]["delta"]
+                    except (ValueError, KeyError, IndexError):
+                        continue
+                    parts.append(delta.get("content") or "")
+            return "".join(parts).strip()
         except httpx.ConnectError:
             # server died mid-run (e.g. an inference-time crash) -> stop trying
             # it; remaining tasks skip straight to remote.
             if self.proc is None or self.proc.poll() is not None:
                 self.available = False
-            return ""
+            return "".join(parts).strip()
         except Exception:
-            return ""
+            # partial text beats empty - every caller re-verifies content
+            return "".join(parts).strip()
 
     def shutdown(self) -> None:
         self.available = False

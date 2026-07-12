@@ -949,6 +949,12 @@ _SHORT_ANSWER_SUFFIXES = (
     "\n\nState the final answer alone, without reasoning or commentary.",
 )
 
+# "each of the three"-style asks: the question wants every actor's status.
+_EACH_ALL_RX = re.compile(
+    r"\b(?:each of the|what is each|all three|all four|everyone)\b", re.I)
+# Assignment-puzzle signature for the misroute net.
+_ASSIGN_PUZZLE_RX = re.compile(r"\beach\b[^.\n]{0,60}\bexactly one\b", re.I)
+
 # Question words the name-extraction below must never treat as puzzle actors.
 _Q_STOP = frozenset(w.casefold() for w in [
     "Which", "What", "Who", "Whom", "Whose", "Where", "When", "How", "Why",
@@ -1142,6 +1148,15 @@ def _try_logic_solver(local, prompt: str, deadline) -> str:
         if "immbefore" in spec_text or "immafter" in spec_text:
             spec_text = _reground_directions(local, prompt, spec_text,
                                              local_deadline)
+        if "TYPE knights" in spec_text and _EACH_ALL_RX.search(prompt) \
+                and not re.search(r"(?m)^Q\s+roles\b", spec_text):
+            # "What is each of the three?" mistranslated as a single-person
+            # question ships a correct-but-partial answer (fresh-124 L3-3:
+            # 'Petra is a knave.' against a three-status key). The ask names
+            # everyone -> the question kind is deterministically 'roles'.
+            spec_text = re.sub(r"(?m)^Q\s+.*$", "Q roles", spec_text,
+                               count=1)
+            _log("[logic-solver] question override -> roles")
         try:
             ans, n = logicsolve.solve(spec_text)
         except logicsolve.SpecError:
@@ -1747,14 +1762,17 @@ def _try_local(local, category: str, prompt: str, deadline,
     if local is None or not local.available:
         return None
     feats = local.features
-    if category in ("math", "logic"):
-        # Misroute net: heads-and-legs puzzles read as math to the router and
-        # the derivation path fails them (fresh-124: two empties + wrong
-        # answers). The trigger is a narrow regex; real math tasks never
-        # match it.
+    if category in ("math", "logic", "factual"):
+        # Misroute nets: heads-and-legs puzzles read as math to the router,
+        # and assignment puzzles ("each ... exactly one chart type") read as
+        # factual (fresh-124 L3-2: the solver never saw a trivially solvable
+        # elimination). The triggers are narrow; real math/factual tasks do
+        # not match them.
         try:
             from agent import logicsolve as _ls
-            if _ls.INTSYSTEM_RX.search(prompt):
+            if _ls.INTSYSTEM_RX.search(prompt) or (
+                    category in ("math", "factual")
+                    and _ASSIGN_PUZZLE_RX.search(prompt)):
                 ans = _try_logic_solver(local, prompt, deadline)
                 if ans:
                     return ans
@@ -1879,6 +1897,26 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
             cut = max(r.rfind("."), r.rfind("!"), r.rfind("?"))
             if cut >= 40:
                 reply = r[: cut + 1]
+    if reply and category in ("math", "logic"):
+        # A deadline-truncated reasoning trace never states the answer
+        # (fresh-124 L3-5: '1. Start at origin (' shipped verbatim). Try the
+        # trace's own final-answer line; failing that, one 6 s directed
+        # re-ask — the streaming abort has just freed the server.
+        r = reply.rstrip()
+        if len(r) > 80 and r[-1] not in ".!?":
+            fin = _extract_final_answer(r)
+            if fin:
+                _log(f"[local-raw] {category} truncated trace -> extracted answer")
+                reply = fin
+            elif local_deadline - time.monotonic() > 3.0:
+                short = local.chat(
+                    prompt + "\n\nState only the final answer, one short "
+                             "line, no reasoning.",
+                    max_tokens=24,
+                    deadline=min(local_deadline, time.monotonic() + 6.0))
+                if short and short.strip():
+                    _log(f"[local-raw] {category} truncated trace -> re-ask")
+                    reply = short.strip()
     if reply and category == "summarization":
         # A deadline-aborted stream lands here as a mid-sentence fragment
         # (v3 full-124: two raw fragments, both at the 28 s cap — one a

@@ -21,12 +21,25 @@ import re
 
 SENTIMENT_LABELS = ("positive", "negative", "neutral", "mixed")
 
+# Prompts sometimes pin their own vocabulary ("upbeat or downbeat?") and the
+# model echoes it, defeating the closed-set extraction (fresh-124: 'downbeat'
+# shipped raw). Normalize the common synonyms onto the canonical labels.
+_SENTIMENT_SYNONYMS = {
+    "upbeat": "positive", "favorable": "positive", "favourable": "positive",
+    "downbeat": "negative", "unfavorable": "negative",
+    "unfavourable": "negative", "ambivalent": "mixed",
+}
+
 
 def extract_sentiment_label(text: str):
-    """First closed-set label present in the reply, or None."""
+    """First closed-set label present in the reply (synonyms normalized),
+    or None."""
     low = (text or "").casefold()
-    hits = [lb for lb in SENTIMENT_LABELS if lb in low]
-    return hits[0] if len(hits) == 1 else None
+    hits = {lb for lb in SENTIMENT_LABELS if lb in low}
+    for syn, lb in _SENTIMENT_SYNONYMS.items():
+        if re.search(r"\b" + syn + r"\b", low):
+            hits.add(lb)
+    return next(iter(hits)) if len(hits) == 1 else None
 
 
 def sentiment_agree(reply_a: str, reply_b: str):

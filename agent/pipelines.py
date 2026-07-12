@@ -334,6 +334,17 @@ def _gate_timeout(local_deadline) -> float:
     return max(0.0, min(6.0, local_deadline - time.monotonic()))
 
 
+def _code_norm(c: str) -> str:
+    """Comment- and whitespace-insensitive code identity for the
+    unchanged-buggy-code check."""
+    lines = []
+    for ln in c.splitlines():
+        ln = re.sub(r"#.*$", "", ln).rstrip()
+        if ln.strip():
+            lines.append(re.sub(r"\s+", " ", ln.strip()))
+    return "\n".join(lines)
+
+
 def _try_local_code(local, prompt: str, category: str, deadline,
                     ship_unverified: bool = False) -> str:
     """Generate code locally and ship it ONLY if it passes a deterministic
@@ -348,6 +359,28 @@ def _try_local_code(local, prompt: str, category: str, deadline,
     code = codegate.extract_code(reply)
     if not code.strip():
         return None
+    if category == "code-debug":
+        # A "fix" that is the buggy original verbatim is a guaranteed fail
+        # (fresh-124: 2/15 codedebug answers returned the input code with
+        # only a comment added). One forced regeneration; any changed code
+        # beats an unchanged copy.
+        try:
+            original = codegate.extract_code(prompt)
+            if original.strip() \
+                    and _code_norm(code) == _code_norm(original) \
+                    and local_deadline - time.monotonic() > 6.0:
+                _log("[local-code] debug answer identical to original - regenerating")
+                retry = local.chat(
+                    prompt + _CODE_LOCAL_SUFFIX[category]
+                    + "\n\nIMPORTANT: do NOT return the original code "
+                      "unchanged. The original contains a real bug - your "
+                      "answer must change the faulty logic.",
+                    max_tokens=384, temperature=0.4, deadline=local_deadline)
+                rcode = codegate.extract_code(retry or "")
+                if rcode.strip() and _code_norm(rcode) != _code_norm(original):
+                    reply, code = retry, rcode
+        except Exception:
+            pass
 
     # Gate 1 (always): tests derived from the prompt's own worked examples.
     gt = _gate_timeout(local_deadline)
@@ -602,7 +635,12 @@ def _sent_both_aspects(local, prompt: str, deadline) -> bool:
     return bool(b) and b.strip().lower().startswith("yes")
 
 
-def _try_local_sentiment(local, prompt: str, deadline) -> str:
+_SENT_ONE_WORD_RX = re.compile(
+    r"\b(?:single word|one word|one label|only one word)\b", re.I)
+
+
+def _try_local_sentiment(local, prompt: str, deadline,
+                         local_only: bool = False) -> str:
     local_deadline = min(deadline, time.monotonic() + _LOCAL_NLP_BUDGET_S)
     a = local.chat(prompt + _SENT_LOCAL_A, max_tokens=8, deadline=local_deadline)
     if not a:
@@ -619,6 +657,19 @@ def _try_local_sentiment(local, prompt: str, deadline) -> str:
                 and _sent_both_aspects(local, prompt, local_deadline)):
             _log("[local-sent] pos/neg split + both-aspects -> mixed")
             label = "mixed"
+        elif local_only:
+            # LOCAL_ONLY floor: the raw fallback ships an unchecked prose
+            # sentence (fresh-124: 'downbeat' prose graded as a wrong label,
+            # 3/3 sentiment fails came through here). A single-framing label
+            # with the both-aspects check beats raw prose every time.
+            label = la or lb
+            if label in ("positive", "negative") \
+                    and _sent_both_aspects(local, prompt, local_deadline):
+                label = "mixed"
+            if not label:
+                _log("[local-sent] no label extractable -> raw fallback")
+                return None
+            _log("[local-sent] LOCAL_ONLY single-framing label shipped")
         else:
             _log("[local-sent] framings disagree -> remote")
             return None
@@ -629,6 +680,12 @@ def _try_local_sentiment(local, prompt: str, deadline) -> str:
         # substantive — even when the prompt offers a binary choice.
         _log("[local-sent] both-aspects check flips agreed label -> mixed")
         label = "mixed"
+    if _SENT_ONE_WORD_RX.search(prompt):
+        # Explicit single-word ask: any appended reason is a violation the
+        # judge can see (fresh-124 L2-3: 'Respond with a single word' got a
+        # full sentence).
+        _log("[local-sent] single-word ask - label only")
+        return label.capitalize()
     reason = local.chat(
         prompt + f"\n\nThe sentiment is {label}. State the key reason in at "
                  "most 10 words.",
@@ -718,7 +775,8 @@ def _ner_candidates(text: str) -> list:
     return out
 
 
-def _ner_sweep(local, prompt: str, pairs: list, deadline) -> list:
+def _ner_sweep(local, prompt: str, pairs: list, deadline,
+               max_verify: int = 4) -> list:
     """Add model-confirmed missing candidates to an extraction; fix known
     location types via gazetteer. Never removes an existing entity except to
     replace it with a confirmed longer span containing it."""
@@ -738,6 +796,13 @@ def _ner_sweep(local, prompt: str, pairs: list, deadline) -> list:
         if typ is not None:  # money/date: pattern-typed, auto-add
             pairs.append((ent, typ))
             have.append(ent.casefold().strip())
+        elif ent.casefold().strip() in _GAZ_LOC:
+            # Known location, verbatim in source: no verify call needed
+            # (fresh-124 L1-2: 'Geneva' lost the 4-slot verify race and
+            # stayed missing — gazetteer hits are free recall).
+            pairs.append((ent, "LOCATION"))
+            have.append(ent.casefold().strip())
+            _log(f"[ner-sweep] gazetteer added {ent} - LOCATION")
         else:
             todo_verify.append(ent)
     # multiword spans first (the observed misses: Nobel Committee class)
@@ -745,7 +810,7 @@ def _ner_sweep(local, prompt: str, pairs: list, deadline) -> list:
     checked = 0
     sents = _SENT_SPLIT_RX.split(prompt)
     for ent in todo_verify:
-        if checked >= 4 or deadline - time.monotonic() < 3.0:
+        if checked >= max_verify or deadline - time.monotonic() < 3.0:
             break
         checked += 1
         ctx = next((s for s in sents if ent in s), prompt[:400])
@@ -766,6 +831,53 @@ def _ner_sweep(local, prompt: str, pairs: list, deadline) -> list:
             pairs.append((ent, typ))
             have.append(ent.casefold().strip())
             _log(f"[ner-sweep] added {ent} - {typ}")
+    return pairs
+
+
+_NER_EXCLUDE_RX = re.compile(
+    r"\b(?:ignore|ignoring|exclude|excluding|omit|omitting"
+    r"|do not (?:include|list|return|extract))\s+"
+    r"(?:the\s+|any\s+)?(dates?|times?|money|monetary amounts?|amounts?)\b",
+    re.I)
+_NER_EXACT_N_RX = re.compile(
+    r"\bexactly\s+(one|two|three|four|five|six|seven|eight|nine|ten|\d+)\s+"
+    r"(?:named\s+)?(?:items?|entities|entries|names?)\b", re.I)
+
+
+def _ner_apply_constraints(prompt: str, pairs: list, base_keys: set) -> list:
+    """Honor the prompt's explicit output constraints — an extra entity
+    against an 'exactly four items' or 'ignore dates' instruction is a
+    judge-visible violation (fresh-124: 2 strict fails)."""
+    excl = set()
+    for m in _NER_EXCLUDE_RX.finditer(prompt):
+        w = m.group(1).lower()
+        excl.add("DATE" if (w.startswith("date") or w.startswith("time"))
+                 else "MONEY")
+    if excl:
+        pairs = [(e, t) for e, t in pairs if t not in excl]
+    m = _NER_EXACT_N_RX.search(prompt)
+    if m:
+        tok = m.group(1).lower()
+        want = _NUM_WORDS.get(tok) if tok in _NUM_WORDS else (
+            int(tok) if tok.isdigit() else None)
+        if want and len(pairs) > want:
+            # drop sweep additions first, then pattern-typed extras — the
+            # model-agreed base is the highest-confidence core
+            def keep_rank(p):
+                e, t = p
+                r = 0
+                if e.casefold().strip() not in base_keys:
+                    r += 2
+                if t in ("DATE", "MONEY"):
+                    r += 1
+                return r
+            ranked = sorted(pairs, key=keep_rank)[:want]
+            pairs = [p for p in pairs if p in ranked]
+            _log(f"[local-ner] exactly-{want} ask - trimmed to {len(pairs)}")
+    # an all-lowercase single word is a common noun, never a named entity
+    # ('startup - ORGANIZATION' class); money/date patterns excepted
+    pairs = [(e, t) for e, t in pairs
+             if t in ("DATE", "MONEY") or " " in e or not e.islower()]
     return pairs
 
 
@@ -795,18 +907,38 @@ def _try_local_ner(local, prompt: str, deadline, local_only=False) -> str:
         verified.append(pairs)
     base = agreed
     how = "agreed"
-    if base is None and local_only and verified:
-        # LOCAL_ONLY has no remote net - a single verified sample + sweep
-        # beats the raw unverified fallback.
-        base = verified[0]
-        how = "single-verified"
+    max_verify = 4
+    if base is None and local_only:
+        if verified:
+            # LOCAL_ONLY has no remote net - a single verified sample + sweep
+            # beats the raw unverified fallback.
+            base = verified[0]
+            how = "single-verified"
+        else:
+            # Sweep-only floor: raw prose here shipped a hallucinated entity
+            # set once (fresh-124 L2-1 invented three names). Deterministic
+            # verbatim candidates + per-candidate verification cannot
+            # hallucinate; give the verify loop a bigger budget since it is
+            # building the whole set.
+            base = []
+            how = "sweep-only"
+            max_verify = 8
     if base is None:
         _log("[local-ner] no two verified samples agree -> remote")
         return None
     try:
-        swept = _ner_sweep(local, prompt, list(base), local_deadline)
+        swept = _ner_sweep(local, prompt, list(base), local_deadline,
+                           max_verify=max_verify)
     except Exception:
         swept = base
+    if how == "sweep-only" and len(swept) < 2:
+        _log("[local-ner] sweep-only found <2 entities -> raw fallback")
+        return None
+    base_keys = {e.casefold().strip() for e, _ in base}
+    try:
+        swept = _ner_apply_constraints(prompt, swept, base_keys)
+    except Exception:
+        pass
     _log(f"[local-ner] {len(swept)} entities ({how}+sweep) - shipped local")
     return localgate.format_entities(swept)
 
@@ -816,6 +948,53 @@ _SHORT_ANSWER_SUFFIXES = (
     "\n\nAnswer with just the final answer and nothing else.",
     "\n\nState the final answer alone, without reasoning or commentary.",
 )
+
+# Question words the name-extraction below must never treat as puzzle actors.
+_Q_STOP = frozenset(w.casefold() for w in [
+    "Which", "What", "Who", "Whom", "Whose", "Where", "When", "How", "Why",
+    "Does", "Do", "Did", "Is", "Are", "Was", "Were", "Can", "Could", "Would",
+    "Should", "If"])
+
+
+def _logic_directed_recheck(local, prompt: str, ans: str, deadline) -> str:
+    """The fallback path can ship a reasoning trace that never answers the
+    actual question (fresh-124: derived scatter/line/pie but left 'Which
+    chart type does Tan build?' unanswered; answered one of three asked
+    knight/knave statuses). Deterministic check: every name the question
+    asks about must appear in the answer — if not, one directed re-ask."""
+    try:
+        q = None
+        for s in re.split(r"(?<=[.!?])\s+", prompt):
+            if s.strip().endswith("?"):
+                q = s.strip()
+        if not q:
+            return ans
+        stop = _CAND_STOP | _Q_STOP
+        names = [w for w in re.findall(r"\b[A-Z][a-z]{2,}\b", q)
+                 if w.casefold() not in stop]
+        if re.search(r"\beach\b|\ball (?:three|four|five)\b|\bevery\b", q, re.I):
+            actors = [w for w in set(re.findall(r"\b[A-Z][a-z]{2,}\b", prompt))
+                      if prompt.count(w) >= 2 and w.casefold() not in stop]
+            if 2 <= len(actors) <= 6:
+                names = sorted(set(names) | set(actors))
+        low = ans.casefold()
+        missing = [n for n in names if n.casefold() not in low]
+        if not missing or deadline - time.monotonic() < 4.0:
+            return ans
+        r = local.chat(
+            prompt + "\n\nA partial analysis concluded: " + ans[-300:]
+            + "\n\nNow answer the question completely, covering "
+            + ", ".join(missing[:4])
+            + ". Reply with only the final answer, no reasoning.",
+            max_tokens=56,
+            deadline=min(deadline, time.monotonic() + 10.0))
+        if r and r.strip() \
+                and all(n.casefold() in r.casefold() for n in missing):
+            _log("[local-logic] directed recheck completed the answer")
+            return r.strip()
+    except Exception:
+        pass
+    return ans
 
 
 # ---------------- deterministic logic solver ----------------
@@ -1273,6 +1452,17 @@ def _sum_content_ok(prompt: str, draft: str) -> bool:
     return any(a in d for a in anchors)
 
 
+def _missing_anchors(prompt: str, draft: str) -> list:
+    """Distinctive source tokens (numerics first, then proper nouns) absent
+    from the draft — used to name the exact gaps in a directed retry."""
+    d = (draft or "").casefold()
+    nums = [a for a in _ANCHOR_NUM_RX.findall(prompt)
+            if len(a) >= 2 and a.casefold() not in d]
+    props = [m for m in _ANCHOR_PROPER_RX.findall(prompt)
+             if m.casefold() not in d]
+    return list(dict.fromkeys(nums + props))
+
+
 def _sum_rich(prompt: str, draft: str) -> bool:
     """Stronger threshold used only as a RETRY trigger (never a ship gate):
     an anchor-rich passage deserves >=2 echoed anchors INCLUDING a numeric
@@ -1356,16 +1546,30 @@ def _try_local_sum_structured(local, prompt: str, deadline,
         if draft and _sentence_count(draft) == 1:
             if (not _sum_rich(prompt, draft)
                     and local_deadline - time.monotonic() > 4.0):
+                missing = _missing_anchors(prompt, draft)
+                hint = (" You must mention: " + ", ".join(missing[:5]) + "."
+                        if missing else
+                        " You must include the specific figures (costs, "
+                        "percentages, dates) and proper names from the "
+                        "passage.")
                 redo = local.chat(
-                    prompt + "\n\nOutput only the one-sentence summary. You "
-                             "must include the specific figures (costs, "
-                             "percentages, dates) and proper names from "
-                             "the passage.",
+                    prompt + "\n\nOutput only the one-sentence summary."
+                    + hint,
                     max_tokens=96, deadline=local_deadline)
                 if (redo and _sentence_count(redo) == 1
                         and _sum_rich(prompt, redo)):
                     return _sum_ship(prompt, redo, hybrid,
                                      "one-sentence specifics")
+                # Still anchor-thin after the directed redo: the extractive
+                # summary carries the source's own figures by construction
+                # (fresh-124: 10/20 sum fails read "omits the $X / count /
+                # timeline anchor" over count-valid but hollow drafts).
+                ext = _extractive_summary(prompt)
+                if ext and _sentence_count(ext) == 1 \
+                        and _sum_rich(prompt, ext):
+                    _log("[local-sum] anchor-thin draft -> extractive")
+                    return _sum_ship(prompt, ext, hybrid,
+                                     "one-sentence extractive")
             return _sum_ship(prompt, draft, hybrid, "one-sentence")
         if draft:
             redo = local.chat("Rewrite this as exactly ONE sentence. Output "
@@ -1414,6 +1618,32 @@ def _try_local_sum_structured(local, prompt: str, deadline,
             if _bullet_count(draft) != want:
                 return None
         draft = _enforce_bullets(draft, cap, req)
+        if not _sum_rich(prompt, draft):
+            # Count-valid but anchor-thin bullets fail on content (fresh-124:
+            # 4 bullet summaries dropped the one named figure). One directed
+            # redo when time allows; the extractive bullets carry the
+            # source's figures by construction.
+            if local_deadline - time.monotonic() > 8.0:
+                missing = _missing_anchors(prompt, draft)
+                if missing:
+                    redo = local.chat(
+                        prompt + ask + " You must mention: "
+                        + ", ".join(missing[:5]) + ".",
+                        max_tokens=btok, deadline=local_deadline)
+                    if redo and _bullet_count(redo) == want:
+                        if not cap:
+                            redo = _fix_trailing_fragment(redo)
+                        if _bullet_count(redo) == want:
+                            redo = _enforce_bullets(redo, cap, req)
+                            if _sum_rich(prompt, redo):
+                                return _sum_ship(prompt, redo, hybrid,
+                                                 "bullet anchors-redo")
+            ext = _extractive_summary(prompt)
+            if ext and _bullet_count(ext) == want and _sum_rich(prompt, ext):
+                ext = _enforce_bullets(ext, cap, req)
+                if _bullet_count(ext) == want:
+                    _log("[local-sum] anchor-thin bullets -> extractive")
+                    return _sum_ship(prompt, ext, hybrid, "bullet extractive")
         return _sum_ship(prompt, draft, hybrid,
                          "bullet-capped" if cap else "bullet-count")
     return None
@@ -1481,15 +1711,23 @@ def _try_local_sum(local, prompt: str, deadline, hybrid: bool = False) -> str:
             # judge-sim fresh-124: 8 strict fails were within-format
             # summaries that dropped the passage's costs/percentages/dates;
             # format verification alone cannot see that.
+            missing = _missing_anchors(prompt, draft)
+            hint = (" You must mention: " + ", ".join(missing[:5]) + "."
+                    if missing else
+                    " You must include the specific figures (costs, "
+                    "percentages, dates) and proper names from the passage.")
             redo = local.chat(
                 prompt + f"\n\nOutput only the summary, in at most {target} "
-                         f"words. You must include the specific figures "
-                         "(costs, percentages, dates) and proper names "
-                         "from the passage.",
+                         "words." + hint,
                 max_tokens=112, deadline=local_deadline)
             if (redo and localgate.word_count(redo) <= limit
                     and _sum_rich(prompt, redo)):
                 return _sum_ship(prompt, redo, hybrid, "specifics-retry")
+            ext = _extractive_summary(prompt)
+            if ext and localgate.word_count(ext) <= limit \
+                    and _sum_rich(prompt, ext):
+                _log("[local-sum] anchor-thin draft -> extractive")
+                return _sum_ship(prompt, ext, hybrid, "extractive within-limit")
         return _sum_ship(prompt, draft, hybrid, "within-limit")
     if draft:
         shorter = local.chat(
@@ -1534,7 +1772,8 @@ def _try_local(local, category: str, prompt: str, deadline,
         # LOCAL_ONLY phases math onto the general model (stronger reasoner).
         return _try_local_math(local, prompt, deadline, local_only=True)
     if category == "sentiment" and "sentiment" in feats:
-        return _try_local_sentiment(local, prompt, deadline)
+        return _try_local_sentiment(local, prompt, deadline,
+                                    local_only=local_only)
     if category == "ner" and "ner" in feats:
         return _try_local_ner(local, prompt, deadline, local_only=local_only)
     if category == "summarization" and "sum" in feats:
@@ -1553,9 +1792,12 @@ def _try_local(local, category: str, prompt: str, deadline,
                                    time.monotonic() + max(6.0, avail * 0.6)))
             if ans:
                 return ans
-        return _try_local_short_agree(local, prompt, deadline, "local-logic",
-                                      local_only=local_only,
-                                      ship_best=local_only or hybrid_policy == "h2")
+        ans = _try_local_short_agree(local, prompt, deadline, "local-logic",
+                                     local_only=local_only,
+                                     ship_best=local_only or hybrid_policy == "h2")
+        if ans:
+            ans = _logic_directed_recheck(local, prompt, ans, deadline)
+        return ans
     # factual deliberately has NO verified path: agreement games truncate
     # multi-part answers and program answers are nonsense for recall
     # (measured: factual 7/7 via the rich raw path vs 4/7 via short-agree).

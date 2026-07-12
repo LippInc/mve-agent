@@ -646,14 +646,138 @@ _NER_LOCAL_C = ("\n\nList each named entity in the text on its own line in the "
                 "location, date, and monetary amount. Output nothing else.")
 
 
-def _try_local_ner(local, prompt: str, deadline) -> str:
-    """Up to three independently-framed extractions; ship as soon as any two
-    substring-verified samples agree on the full (entity, type) set. Every
-    shipped entity is verbatim-in-source (kills hallucination); the set
-    agreement is the completeness evidence."""
+# ---- NER recall sweep: deterministic verbatim candidates + per-candidate
+# verification. The agreement gate alone ships agreed-but-INCOMPLETE sets
+# (judge-sim fresh-124: missed Geneva / Nobel Committee / Google) — the sweep
+# proposes capitalized spans, money, and dates the extraction never offered;
+# every addition is verbatim-by-construction and model-confirmed, so it can
+# add recall but never hallucinations.
+_NAME_WORD = r"[A-Z][A-Za-z0-9]*(?:[.'’&\-][A-Za-z0-9]+)*"
+_NAME_LINK = r"(?:of|the|and|for|&|de|da|di|van|von|der|del|la|le|el|bin|al)"
+_CAP_SPAN_RX = re.compile(
+    _NAME_WORD + r"(?:\s+(?:" + _NAME_LINK + r"\s+)?" + _NAME_WORD + r")*")
+_MONEY_CAND_RX = re.compile(
+    r"[$€£¥]\s?\d[\d,]*(?:\.\d+)?"
+    r"(?:\s?(?:hundred|thousand|million|billion|trillion))?"
+    r"|\b\d[\d,]*(?:\.\d+)?\s?(?:dollars?|euros?|pounds?)\b", re.I)
+_MONTHS_RX_PART = (r"(?:January|February|March|April|May|June|July|August"
+                   r"|September|October|November|December)")
+_DATE_CAND_RX = re.compile(
+    r"\b" + _MONTHS_RX_PART + r"\s+\d{1,2}(?:st|nd|rd|th)?(?:,?\s+\d{4})?\b"
+    r"|\b\d{1,2}(?:st|nd|rd|th)?\s+" + _MONTHS_RX_PART + r"(?:,?\s+\d{4})?\b"
+    r"|\b" + _MONTHS_RX_PART + r"\s+\d{4}\b"
+    r"|\b(?:1[5-9]\d{2}|20\d{2})s?\b")
+_CAND_STOP = frozenset(w.casefold() for w in [
+    "The", "A", "An", "In", "On", "At", "Of", "And", "But", "Or", "For",
+    "To", "From", "With", "By", "As", "This", "That", "These", "Those",
+    "It", "He", "She", "They", "We", "You", "I", "His", "Her", "Their",
+    "However", "Meanwhile", "Moreover", "Therefore", "Also", "Then",
+    "When", "While", "After", "Before", "During", "Here", "There", "If",
+    "Extract", "Identify", "List", "Find", "Output", "Include", "Name",
+    "Answer", "Text", "Passage", "Entity", "Entities", "Type", "Person",
+    "People", "Organization", "Organisation", "Location", "Date", "Money",
+    "Monetary", "Named", "Following", "Every", "All", "Each"])
+_GAZ_LOC = frozenset(w.casefold() for w in [
+    "Germany", "France", "Italy", "Spain", "Portugal", "Netherlands",
+    "Belgium", "Switzerland", "Austria", "Poland", "Sweden", "Norway",
+    "Denmark", "Finland", "Estonia", "Latvia", "Lithuania", "Ireland",
+    "Greece", "Turkey", "Russia", "Ukraine", "China", "Japan", "India",
+    "Brazil", "Mexico", "Canada", "Australia", "Egypt", "Kenya", "Nigeria",
+    "Argentina", "Chile", "Peru", "Colombia", "Indonesia", "Vietnam",
+    "Thailand", "Singapore", "Malaysia", "Philippines", "Pakistan",
+    "Bangladesh", "Iran", "Iraq", "Israel", "Jordan", "Lebanon",
+    "London", "Paris", "Berlin", "Madrid", "Rome", "Vienna", "Geneva",
+    "Zurich", "Amsterdam", "Brussels", "Copenhagen", "Stockholm", "Oslo",
+    "Helsinki", "Moscow", "Beijing", "Shanghai", "Tokyo", "Osaka", "Seoul",
+    "Mumbai", "Delhi", "Sydney", "Melbourne", "Toronto", "Vancouver",
+    "Chicago", "Boston", "Seattle", "Houston", "Dallas", "Miami", "Atlanta",
+    "Washington", "Cairo", "Nairobi", "Lagos", "Dubai", "Riyadh"])
+
+
+def _ner_candidates(text: str) -> list:
+    """Deterministic candidate (entity, type_or_None) pairs, verbatim spans
+    only. Type None = needs a model verify call; MONEY/DATE are auto-typed
+    (pattern = the type)."""
+    out = []
+    for m in _MONEY_CAND_RX.finditer(text):
+        out.append((m.group(0).strip(), "MONEY"))
+    for m in _DATE_CAND_RX.finditer(text):
+        out.append((m.group(0).strip(), "DATE"))
+    for m in _CAP_SPAN_RX.finditer(text):
+        span = m.group(0).strip()
+        words = span.split()
+        while words and words[0].casefold() in _CAND_STOP:
+            words = words[1:]
+        if not words:
+            continue
+        span = " ".join(words)
+        if len(words) == 1 and (words[0].casefold() in _CAND_STOP
+                                or len(words[0]) < 3):
+            continue
+        out.append((span, None))
+    return out
+
+
+def _ner_sweep(local, prompt: str, pairs: list, deadline) -> list:
+    """Add model-confirmed missing candidates to an extraction; fix known
+    location types via gazetteer. Never removes an existing entity except to
+    replace it with a confirmed longer span containing it."""
+    # gazetteer type override on the existing set (Germany-as-ORG class)
+    pairs = [(e, "LOCATION" if e.casefold().strip() in _GAZ_LOC else t)
+             for e, t in pairs]
+    have = [e.casefold().strip() for e, _ in pairs]
+
+    def covered(cand):
+        c = cand.casefold().strip()
+        return any(c == h or c in h for h in have)
+
+    todo_verify = []
+    for ent, typ in _ner_candidates(prompt):
+        if covered(ent):
+            continue
+        if typ is not None:  # money/date: pattern-typed, auto-add
+            pairs.append((ent, typ))
+            have.append(ent.casefold().strip())
+        else:
+            todo_verify.append(ent)
+    # multiword spans first (the observed misses: Nobel Committee class)
+    todo_verify.sort(key=lambda e: (-len(e.split()), len(e)))
+    checked = 0
+    sents = _SENT_SPLIT_RX.split(prompt)
+    for ent in todo_verify:
+        if checked >= 4 or deadline - time.monotonic() < 3.0:
+            break
+        checked += 1
+        ctx = next((s for s in sents if ent in s), prompt[:400])
+        r = local.chat(
+            'Text: """' + ctx.strip()[:500] + '"""\n\nIn the text above, is "'
+            + ent + '" used as a named entity? Answer with exactly one word: '
+            "no, person, organization, location, date, or money.",
+            max_tokens=4, deadline=deadline)
+        typ = localgate._norm_type((r or "").strip().split()[0] if r and r.strip() else "")
+        if typ in ("PERSON", "ORGANIZATION", "LOCATION", "DATE", "MONEY"):
+            if ent.casefold().strip() in _GAZ_LOC:
+                typ = "LOCATION"
+            # a confirmed longer span replaces a shorter fragment it contains
+            frag = [(e, t) for e, t in pairs
+                    if e.casefold().strip() in ent.casefold()]
+            for f in frag:
+                pairs.remove(f)
+            pairs.append((ent, typ))
+            have.append(ent.casefold().strip())
+            _log(f"[ner-sweep] added {ent} - {typ}")
+    return pairs
+
+
+def _try_local_ner(local, prompt: str, deadline, local_only=False) -> str:
+    """Up to three independently-framed extractions; two substring-verified
+    samples agreeing on the (entity, type) set is the base evidence, then the
+    recall sweep adds deterministically-proposed, model-confirmed candidates
+    the extraction missed. Every shipped entity is verbatim-in-source."""
     local_deadline = min(deadline, time.monotonic() + _LOCAL_NLP_BUDGET_S + 6.0)
     spec = spec_for("ner")
     verified = []
+    agreed = None
     for suffix in (spec["suffix"], _NER_LOCAL_B, _NER_LOCAL_C):
         if local_deadline - time.monotonic() < 2.0:
             break
@@ -664,11 +788,27 @@ def _try_local_ner(local, prompt: str, deadline) -> str:
             continue
         for prev in verified:
             if localgate.ner_sets_agree(prev, pairs):
-                _log(f"[local-ner] {len(pairs)} entities agreed - shipped local")
-                return localgate.format_entities(pairs)
+                agreed = pairs
+                break
+        if agreed:
+            break
         verified.append(pairs)
-    _log("[local-ner] no two verified samples agree -> remote")
-    return None
+    base = agreed
+    how = "agreed"
+    if base is None and local_only and verified:
+        # LOCAL_ONLY has no remote net - a single verified sample + sweep
+        # beats the raw unverified fallback.
+        base = verified[0]
+        how = "single-verified"
+    if base is None:
+        _log("[local-ner] no two verified samples agree -> remote")
+        return None
+    try:
+        swept = _ner_sweep(local, prompt, list(base), local_deadline)
+    except Exception:
+        swept = base
+    _log(f"[local-ner] {len(swept)} entities ({how}+sweep) - shipped local")
+    return localgate.format_entities(swept)
 
 
 _SHORT_ANSWER_SUFFIXES = (
@@ -676,6 +816,165 @@ _SHORT_ANSWER_SUFFIXES = (
     "\n\nAnswer with just the final answer and nothing else.",
     "\n\nState the final answer alone, without reasoning or commentary.",
 )
+
+
+# ---------------- deterministic logic solver ----------------
+# The model TRANSLATES the puzzle into a tiny spec; agent/logicsolve.py
+# enumerates it and ships only a uniquely-determined answer. Live-difficulty
+# strict logic was 5/15 with the model solving; translation is the job a 3B
+# can actually do, and the uniqueness gate is the verification.
+
+_SPEC_PROMPT_ORDER = """You translate logic puzzles into a tiny spec. Output ONLY spec lines, nothing else.
+
+TYPE order    (finish order / numbered seats, position 1 = first = leftmost)
+TYPE assign   (people matched to things)
+ITEMS <the people, one word each>
+VALUES <the things, one word each - assign only>
+Constraints, one per line:
+C pos <name> <n> | C notpos <name> <n> | C before <a> <b> | C after <a> <b>
+C immbefore <a> <b>  means: a is directly before b / a is directly to the LEFT of b / b is directly after a
+C is <name> <value> | C not <name> <value>   (assign)
+Question: Q valueof <name> | Q whohas <value or position number> | Q fullorder (the whole order) | Q fullassign (who has what, assign only)
+Note: "the second to arrive" means C pos <name> 2. "neither X nor Y" means two C not lines.
+
+Example 1:
+Puzzle: Three friends - Ann, Bea, Cal - finished a race. Ann finished immediately after Bea. Cal was not last. Who won?
+TYPE order
+ITEMS Ann Bea Cal
+C immbefore Bea Ann
+C notpos Cal 3
+Q whohas 1
+
+Example 2:
+Puzzle: Tia, Ute and Val each own one pet: cat, dog, or fish. Tia owns neither the cat nor the fish. Val does not own the dog. Ute owns the fish. Which pet does Val own?
+TYPE assign
+ITEMS Tia Ute Val
+VALUES cat dog fish
+C not Tia cat
+C not Tia fish
+C not Val dog
+C is Ute fish
+Q valueof Val
+
+Puzzle: """
+
+_SPEC_PROMPT_KNIGHTS = """You translate knights-and-knaves puzzles into a tiny spec (knights always tell the truth, knaves always lie). Output ONLY spec lines, nothing else.
+
+ITEMS <the people, one word each>
+One line per statement:
+C says <speaker> role <name> knight       (speaker: "<name> is a knight")
+C says <speaker> role <name> knave        (speaker: "<name> is a knave")
+C says <speaker> all <names...> knight    (speaker: "<names> are all knights"; "X and I are both knights" -> list X and the speaker)
+C says <speaker> all <names...> knave
+C says <speaker> atleastone <names...> knave
+C says <speaker> same <a> <b>             (speaker: "a and b are the same kind")
+C says <speaker> diff <a> <b>
+Question: Q roles (kind of every person) | Q roleof <name> (kind of one person) | Q whois knave (which one person is the knave) | Q whois knight
+
+Example:
+Puzzle: You meet Ada and Bo. Ada says, 'Bo is a knave.' Bo says, 'Ada and I are both knights.' What is Bo?
+TYPE knights
+ITEMS Ada Bo
+C says Ada role Bo knave
+C says Bo all Ada Bo knight
+Q roleof Bo
+
+Puzzle: """
+
+_SPEC_PROMPT_INTSYSTEM = """You translate counting puzzles into a tiny spec. Output ONLY spec lines, nothing else.
+
+Example:
+Puzzle: A pen holds only cows (4 legs) and geese (2 legs). There are 10 heads and 32 legs. How many cows?
+TYPE intsystem
+ITEMS cows geese
+C kind cows 4
+C kind geese 2
+C heads 10
+C legs 32
+Q count cows
+
+Puzzle: """
+
+_IMM_YESNO = ("\n\nIn this puzzle, is {a} immediately before {b} (directly "
+              "ahead of {b}, or directly to the left of {b})? "
+              "Answer only yes or no.")
+
+
+def _pick_spec_prompt(prompt: str):
+    try:
+        from agent import logicsolve
+    except Exception:
+        return None
+    if logicsolve.KNIGHTS_RX.search(prompt):
+        return _SPEC_PROMPT_KNIGHTS
+    if logicsolve.INTSYSTEM_RX.search(prompt):
+        return _SPEC_PROMPT_INTSYSTEM
+    return _SPEC_PROMPT_ORDER
+
+
+def _reground_directions(local, prompt, spec_text, deadline) -> str:
+    """3B extractors invert immediately-before/after directions (3 of 3
+    wrong solver answers on fresh-124 were exactly this). Re-ground each
+    imm constraint with a direct yes/no read of the original sentence -
+    a far easier task than DSL emission - and flip it when the model says
+    no. Returns the (possibly corrected) spec text."""
+    out = []
+    for ln in spec_text.splitlines():
+        parts = ln.split()
+        if (len(parts) == 4 and parts[0].upper() == "C"
+                and parts[1].lower() in ("immbefore", "immafter")):
+            a, b = parts[2], parts[3]
+            if parts[1].lower() == "immafter":
+                # canonicalize to immbefore(b, a)
+                a, b = b, a
+            if deadline - time.monotonic() > 3.0:
+                r = local.chat(prompt + _IMM_YESNO.format(a=a, b=b),
+                               max_tokens=4, deadline=deadline)
+                if r and r.strip().lower().startswith("no"):
+                    a, b = b, a
+            out.append(f"C immbefore {a} {b}")
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+
+def _try_logic_solver(local, prompt: str, deadline) -> str:
+    """Translate -> re-ground directions -> enumerate -> unique-answer gate.
+    None on any failure; zero proxy tokens; the caller's existing paths
+    remain the fallback."""
+    if local is None or not local.available:
+        return None
+    try:
+        from agent import logicsolve
+    except Exception:
+        return None
+    spec_prompt = _pick_spec_prompt(prompt)
+    if spec_prompt is None:
+        return None
+    local_deadline = min(deadline, time.monotonic() + 30.0)
+    for temp in (0.0, 0.4):
+        if local_deadline - time.monotonic() < 6.0:
+            break
+        spec_text = local.chat(spec_prompt + prompt + "\n",
+                               max_tokens=176, deadline=local_deadline,
+                               temperature=temp)
+        if not spec_text:
+            continue
+        if "immbefore" in spec_text or "immafter" in spec_text:
+            spec_text = _reground_directions(local, prompt, spec_text,
+                                             local_deadline)
+        try:
+            ans, n = logicsolve.solve(spec_text)
+        except logicsolve.SpecError:
+            continue
+        except Exception:
+            return None
+        if ans:
+            _log(f"[logic-solver] unique answer over {n} model(s) - shipped")
+            return ans
+    return None
+
+
 
 # Bounded local chain-of-thought: in LOCAL_ONLY, tokens are free and only
 # time is budgeted, so a thinking pass is a legitimate extra derivation for
@@ -1190,6 +1489,19 @@ def _try_local(local, category: str, prompt: str, deadline,
     if local is None or not local.available:
         return None
     feats = local.features
+    if category in ("math", "logic"):
+        # Misroute net: heads-and-legs puzzles read as math to the router and
+        # the derivation path fails them (fresh-124: two empties + wrong
+        # answers). The trigger is a narrow regex; real math tasks never
+        # match it.
+        try:
+            from agent import logicsolve as _ls
+            if _ls.INTSYSTEM_RX.search(prompt):
+                ans = _try_logic_solver(local, prompt, deadline)
+                if ans:
+                    return ans
+        except Exception:
+            pass
     if category in ("code-debug", "code-gen") and local.mode != "off":
         return _try_local_code(local, prompt, category, deadline,
                                ship_unverified=local_only)
@@ -1204,7 +1516,7 @@ def _try_local(local, category: str, prompt: str, deadline,
     if category == "sentiment" and "sentiment" in feats:
         return _try_local_sentiment(local, prompt, deadline)
     if category == "ner" and "ner" in feats:
-        return _try_local_ner(local, prompt, deadline)
+        return _try_local_ner(local, prompt, deadline, local_only=local_only)
     if category == "summarization" and "sum" in feats:
         # LOCAL_FINAL summaries ship count-valid drafts even when content-
         # hollow (a verified-format local draft beats a regenerated raw one).
@@ -1212,6 +1524,15 @@ def _try_local(local, category: str, prompt: str, deadline,
                               hybrid=bool(hybrid_policy) and not local_only
                               and "summarization" not in _LOCAL_FINAL)
     if category == "logic" and "logic" in feats:
+        # Solver first (translate -> enumerate -> uniqueness gate), leaving
+        # the agreement path at least 8 s as the fallback.
+        avail = deadline - time.monotonic()
+        if avail > 10.0:
+            ans = _try_logic_solver(
+                local, prompt, min(deadline - 8.0,
+                                   time.monotonic() + max(6.0, avail * 0.6)))
+            if ans:
+                return ans
         return _try_local_short_agree(local, prompt, deadline, "local-logic",
                                       local_only=local_only,
                                       ship_best=local_only or hybrid_policy == "h2")

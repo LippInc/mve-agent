@@ -681,7 +681,7 @@ _SENT_REASON_RX = re.compile(
 # templated reason so the shipped sentence is text-anchored, never invented.
 _SENT_NEG_LEX = re.compile(
     r"\b(?:late|delay\w*|damag\w*|dent\w*|missing|broken?|broke|defect\w*|"
-    r"flaw\w*|scratch\w*|crack\w*|faulty|leak\w*|fail\w*|disappoint\w*|"
+    r"flaw(?:s|ed)?|scratch\w*|crack\w*|faulty|leak\w*|fail\w*|disappoint\w*|"
     r"rude|wrong|slow|worst|terrible|awful|refund|complaint?s?|problem\w*|"
     r"issue?s?)\b", re.I)
 _SENT_POS_LEX = re.compile(
@@ -714,7 +714,12 @@ def _sent_lex_sides(prompt: str):
                 out.append(t)
         return out
 
-    return _hits(_SENT_NEG_LEX), _hits(_SENT_POS_LEX)
+    neg, pos = _hits(_SENT_NEG_LEX), _hits(_SENT_POS_LEX)
+    # A term both lexicons claim is ambiguous — shipping it on either side of
+    # the templated reason risks nonsense ('negatives (flawless)'); drop it
+    # from both. Whole-term match, so 'worked perfectly' won't shadow 'work'.
+    dup = {t for t in neg if t in set(pos)}
+    return [t for t in neg if t not in dup], [t for t in pos if t not in dup]
 
 
 def _try_local_sentiment(local, prompt: str, deadline,

@@ -13,7 +13,13 @@ import re
 # detect(). Misrouting INTO an answer-shape-changing category (math's bare
 # number, code's code-only output) is the expensive direction, so math needs
 # numeric evidence and the code rules need a code hint before they can fire.
-_CODE_HINT = re.compile(r"```|\bdef\b|\bfunction\b|\bcode\b|\bpython\b|\bjavascript\b")
+_CODE_HINT = re.compile(r"```|\bdef\b|\bfunction\b|\bcode\b|\bpython\b|\bjavascript\b"
+                        # bare noun/verb hints _CODEGEN_RX itself anticipates
+                        # ("write a script that...") — safe because the code
+                        # rules still need their own verb+noun/bug evidence
+                        # to fire (hunt #11); bare "method" stays out (too
+                        # common as a prose word).
+                        r"|\bscript\b|\bprogram\b|\balgorithm\b|\bimplement\b")
 _SENTIMENT_RX = re.compile(
     r"\bsentiment\b|classify (the )?(tone|review|feedback)"
     r"|positive,? (or )?negative|positive,? negative,? or neutral"
@@ -22,7 +28,13 @@ _SENTIMENT_RX = re.compile(
     r"|\b(tone|mood) of (this|the) (review|message|feedback|comment|email|post|reply)"
     r"|tone comes across|rate the tone|judge the (tone|sentiment)"
     r"|how (positive|negative|happy|satisfied)"
-    r"|how does (the|this) (customer|reviewer|writer|author) feel")
+    r"|how does (the|this) (customer|reviewer|writer|author) feel"
+    # valence-pair phrasings without the word "sentiment" fell to the
+    # unguarded factual path (hunt #15); the pair form keeps lone
+    # "favorable" (weather, terms) from hijacking factual asks
+    r"|favou?rable,? (or )?unfavou?rable"
+    r"|happy or upset|pleased or displeased|satisfied or dissatisfied"
+    r"|upbeat or downbeat")
 # "headline" only with an authoring verb: "extract entities from this
 # headline" is NER, "write a headline for..." is summarization-shaped.
 _SUMMAR_RX = re.compile(
@@ -67,14 +79,15 @@ _SCIENCE_FACT_RX = re.compile(
 _COUNT_Q_RX = re.compile(r"\bhow many\b|\bnumber of\b|\bcount of\b")
 _BUG_RX = re.compile(r"\bbug(s|gy)?\b|\bbroken\b|\berror\b|\bincorrect\b"
                      r"|wrong (output|result|value|answer)"
-                     r"|(doesn'?t|does not|won'?t|isn'?t) work|fails? (on|when|for)")
+                     r"|(doesn'?t|does not|won'?t|isn'?t) work|fails? (on|when|for)"
+                     r"|\bdefects?\b|\bflaw(s|ed)?\b")
 _CRASH_RX = re.compile(r"\bcrash(es|ed|ing)?\b|\bthrows?\b|\brais(es|ed|ing)\b"
                        r"|\bexception\b|\btraceback\b|stack trace")
 # Inline code on the page (not just the word "function") — evidence there is
 # an existing implementation to debug.
 _ACTUAL_CODE_RX = re.compile(r"```|\bdef\s+\w+\s*\(|\blambda\b|=>")
 _FIXVERB_RX = re.compile(r"\bfix\b|\bcorrect\b|\brepair\b|\bdebug\b"
-                         r"|make it work|get it working")
+                         r"|make it work|get it working|\bpatch\b|\bresolve\b")
 _CODEGEN_RX = re.compile(
     r"\b(write|implement|create|build|design|provide|develop|give|make"
     r"|define|generate|code)\b[\s\S]{0,60}?"

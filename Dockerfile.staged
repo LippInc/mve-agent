@@ -44,6 +44,11 @@ ENV PATH="/opt/llamacpp:${PATH}"
 COPY vendor/models/model.gguf /models/model.gguf
 COPY vendor/models/general.gguf /models/general.gguf
 
+# Offline factual grounding index (Simple-Wikipedia FTS5, built by
+# ops/build-wiki-index; dir may contain only .keep in non-RAG builds — the
+# agent no-ops when the .db file is absent).
+COPY vendor/wiki/ /models/wiki/
+
 COPY agent/ ./agent/
 
 ARG LOCAL_FLAGS="code+,math,sentiment,ner"

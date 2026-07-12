@@ -983,6 +983,28 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
     reply = local.chat(prompt + spec["suffix"],
                        max_tokens=max(spec["max_tokens"], 96),
                        deadline=local_deadline)
+    if category == "factual" and local_deadline - time.monotonic() > 18.0:
+        # Offline grounding pass: the draft's entities steer a BM25 lookup
+        # over the bundled wiki index (see wikirag.py); a grounded regenerate
+        # replaces the recall-only draft. Empty lookup / no index / any error
+        # -> keep the draft (this block can only add, never subtract).
+        try:
+            from agent import wikirag
+            chunks = wikirag.lookup(prompt, reply or "")
+        except Exception:
+            chunks = []
+        if chunks:
+            ref = "\n\n".join("[%s] %s" % (t, b[:700]) for t, b in chunks)
+            grounded = local.chat(
+                "Use the reference text to answer. If it does not contain "
+                "the answer, answer from your own knowledge.\n\nReference:\n"
+                + ref + "\n\nQuestion: " + prompt + "\n\n"
+                + spec["suffix"].strip(),
+                max_tokens=max(spec["max_tokens"], 96),
+                deadline=local_deadline)
+            if grounded and grounded.strip():
+                _log("[local-rag] factual grounded answer shipped")
+                reply = grounded
     if reply and category == "factual":
         # A cap-truncated tail ("...the Hudson Riv") reads as broken to the
         # judge — trim to the last complete sentence when one exists. Only

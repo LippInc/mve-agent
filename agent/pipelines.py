@@ -1137,6 +1137,7 @@ def _try_logic_solver(local, prompt: str, deadline) -> str:
     if spec_prompt is None:
         return None
     local_deadline = min(deadline, time.monotonic() + 30.0)
+    answers = []
     for temp in (0.0, 0.4):
         if local_deadline - time.monotonic() < 6.0:
             break
@@ -1164,8 +1165,20 @@ def _try_logic_solver(local, prompt: str, deadline) -> str:
         except Exception:
             return None
         if ans:
-            _log(f"[logic-solver] unique answer over {n} model(s) - shipped")
-            return ans
+            answers.append(ans)
+    # Agreement gate over the two independent translations: a
+    # mis-translation with a unique solution sails through a first-unique
+    # ship (fresh-124 L3-3 shipped a different wrong answer on consecutive
+    # runs). Two translations agreeing is the file's two-framing doctrine;
+    # a single answer (the other attempt failed/timed out) still ships —
+    # coverage beats abstention when the fallback is a raw 3B guess.
+    if len(answers) == 2 and answers[0] != answers[1]:
+        _log("[logic-solver] translations disagree -> fallback")
+        return None
+    if answers:
+        _log(f"[logic-solver] unique answer ({len(answers)} translation(s) "
+             "agree) - shipped")
+        return answers[0]
     return None
 
 

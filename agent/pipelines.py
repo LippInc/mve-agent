@@ -334,6 +334,24 @@ def _gate_timeout(local_deadline) -> float:
     return max(0.0, min(6.0, local_deadline - time.monotonic()))
 
 
+def _ast_salvage(code: str):
+    """Trim a deadline-truncated code block back to its last parseable
+    form. Returns the original code when it already parses, the trimmed
+    code when a parseable prefix exists, or None when nothing parses."""
+    import ast
+    lines = code.rstrip().splitlines()
+    for cut in range(len(lines), max(0, len(lines) - 20), -1):
+        candidate = "\n".join(lines[:cut]).rstrip()
+        if not candidate:
+            break
+        try:
+            ast.parse(candidate)
+            return candidate
+        except SyntaxError:
+            continue
+    return None
+
+
 def _code_norm(c: str) -> str:
     """Comment- and whitespace-insensitive code identity for the
     unchanged-buggy-code check."""
@@ -354,11 +372,21 @@ def _try_local_code(local, prompt: str, category: str, deadline,
     The entire local attempt (generation + gates) is bounded by local_deadline,
     which sits inside the per-task deadline so a remote fallback always fits."""
     local_deadline = min(deadline, time.monotonic() + _LOCAL_CODE_BUDGET_S)
-    reply = local.chat(prompt + _CODE_LOCAL_SUFFIX[category], max_tokens=384,
+    slow = getattr(local, "slow", False)
+    reply = local.chat(prompt + _CODE_LOCAL_SUFFIX[category],
+                       max_tokens=256 if slow else 384,
                        deadline=local_deadline)
     code = codegate.extract_code(reply)
     if not code.strip():
         return None
+    salvaged = _ast_salvage(code)
+    if salvaged is not None and salvaged != code:
+        # deadline-cut generation: trim to the last parseable statement —
+        # a compiling function with a dropped tail beats broken syntax
+        # (--cpus=1 replay: 3 code answers shipped mid-statement cuts)
+        _log(f"[local-code] {category} truncated code salvaged by ast-trim")
+        code = salvaged
+        reply = code
     if category == "code-debug":
         # A "fix" that is the buggy original verbatim is a guaranteed fail
         # (fresh-124: 2/15 codedebug answers returned the input code with
@@ -399,7 +427,7 @@ def _try_local_code(local, prompt: str, category: str, deadline,
     #   - the candidate code passes all of them
     #   - for code-debug: the ORIGINAL buggy code must FAIL >=1 test, proving the
     #     tests actually discriminate the bug (else the tests are vacuous).
-    if (local.mode == "code+" and n_examples == 0
+    if (local.mode == "code+" and n_examples == 0 and not slow
             and local_deadline - time.monotonic() > 3.0):
         tset = local.chat(code + _SELFTEST_SUFFIX, max_tokens=160,
                           deadline=local_deadline)
@@ -680,11 +708,12 @@ def _try_local_sentiment(local, prompt: str, deadline,
         # substantive — even when the prompt offers a binary choice.
         _log("[local-sent] both-aspects check flips agreed label -> mixed")
         label = "mixed"
-    if _SENT_ONE_WORD_RX.search(prompt):
+    if _SENT_ONE_WORD_RX.search(prompt) or getattr(local, "slow", False):
         # Explicit single-word ask: any appended reason is a violation the
         # judge can see (fresh-124 L2-3: 'Respond with a single word' got a
-        # full sentence).
-        _log("[local-sent] single-word ask - label only")
+        # full sentence). SLOW mode also ships the bare label — the reason
+        # call is optional decoration.
+        _log("[local-sent] label only shipped")
         return label.capitalize()
     reason = local.chat(
         prompt + f"\n\nThe sentiment is {label}. State the key reason in at "
@@ -907,7 +936,7 @@ def _try_local_ner(local, prompt: str, deadline, local_only=False) -> str:
         verified.append(pairs)
     base = agreed
     how = "agreed"
-    max_verify = 4
+    max_verify = 2 if getattr(local, "slow", False) else 4
     if base is None and local_only:
         if verified:
             # LOCAL_ONLY has no remote net - a single verified sample + sweep
@@ -1137,16 +1166,18 @@ def _try_logic_solver(local, prompt: str, deadline) -> str:
     if spec_prompt is None:
         return None
     local_deadline = min(deadline, time.monotonic() + 30.0)
+    slow = getattr(local, "slow", False)
     answers = []
-    for temp in (0.0, 0.4):
+    for temp in ((0.0,) if slow else (0.0, 0.4)):
         if local_deadline - time.monotonic() < 6.0:
             break
         spec_text = local.chat(spec_prompt + prompt + "\n",
-                               max_tokens=176, deadline=local_deadline,
+                               max_tokens=144 if slow else 176,
+                               deadline=local_deadline,
                                temperature=temp)
         if not spec_text:
             continue
-        if "immbefore" in spec_text or "immafter" in spec_text:
+        if not slow and ("immbefore" in spec_text or "immafter" in spec_text):
             spec_text = _reground_directions(local, prompt, spec_text,
                                              local_deadline)
         if "TYPE knights" in spec_text and _EACH_ALL_RX.search(prompt) \
@@ -1693,6 +1724,7 @@ def _try_local_sum_structured(local, prompt: str, deadline,
                            max_tokens=96, deadline=local_deadline)
         if draft and _sentence_count(draft) == 1 and len(draft.split()) >= 5:
             if (not _sum_rich(prompt, draft)
+                    and not getattr(local, "slow", False)
                     and local_deadline - time.monotonic() > 4.0):
                 missing = _missing_anchors(prompt, draft)
                 hint = (" You must mention: " + ", ".join(missing[:5]) + "."
@@ -1758,7 +1790,9 @@ def _try_local_sum_structured(local, prompt: str, deadline,
             ask += " You must use the word(s): " + ", ".join(req) + "."
         # 4+ complete-sentence bullets truncate at a flat 176-token cap
         # (fresh-124: two mid-sentence cutoffs) — scale with the count.
-        btok = min(288, 96 + 48 * want)
+        # SLOW mode shrinks the ask so it completes instead of getting cut.
+        btok = (min(192, 72 + 32 * want) if getattr(local, "slow", False)
+                else min(288, 96 + 48 * want))
         draft = local.chat(prompt + ask, max_tokens=btok,
                            deadline=local_deadline)
         if ((not draft or _bullet_count(draft) != want)
@@ -1777,7 +1811,8 @@ def _try_local_sum_structured(local, prompt: str, deadline,
             # 4 bullet summaries dropped the one named figure). One directed
             # redo when time allows; the extractive bullets carry the
             # source's figures by construction.
-            if local_deadline - time.monotonic() > 8.0:
+            if not getattr(local, "slow", False) \
+                    and local_deadline - time.monotonic() > 8.0:
                 missing = _missing_anchors(prompt, draft)
                 if missing:
                     redo = local.chat(
@@ -1864,6 +1899,7 @@ def _try_local_sum(local, prompt: str, deadline, hybrid: bool = False) -> str:
         max_tokens=112, deadline=local_deadline)
     if draft and localgate.word_count(draft) <= limit:
         if (not _sum_rich(prompt, draft)
+                and not getattr(local, "slow", False)
                 and local_deadline - time.monotonic() > 4.0):
             # Anchor-thin retry: one regenerate demanding specifics —
             # judge-sim fresh-124: 8 strict fails were within-format
@@ -1965,7 +2001,7 @@ def _try_local(local, category: str, prompt: str, deadline,
         ans = _try_local_short_agree(local, prompt, deadline, "local-logic",
                                      local_only=local_only,
                                      ship_best=local_only or hybrid_policy == "h2")
-        if ans:
+        if ans and not getattr(local, "slow", False):
             ans = _logic_directed_recheck(local, prompt, ans, deadline)
         return ans
     # factual deliberately has NO verified path: agreement games truncate

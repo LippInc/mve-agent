@@ -983,24 +983,32 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
     reply = local.chat(prompt + spec["suffix"],
                        max_tokens=max(spec["max_tokens"], 96),
                        deadline=local_deadline)
-    if category == "factual" and local_deadline - time.monotonic() > 18.0:
+    if (category == "factual"
+            and local_deadline - time.monotonic() > 12.0
+            and len(re.findall(r"\d+", prompt)) < 3):
         # Offline grounding pass: the draft's entities steer a BM25 lookup
         # over the bundled wiki index (see wikirag.py); a grounded regenerate
         # replaces the recall-only draft. Empty lookup / no index / any error
-        # -> keep the draft (this block can only add, never subtract).
+        # / regen timeout -> keep the draft (this block can only add, never
+        # subtract). Sized for the real fair-share window (~28-31 s/task):
+        # 3 chunks x 450 chars + an 80-token cap keeps the regenerate at
+        # ~12-16 s on 2 vCPU — the first cut (4x700 + 128) timed out on 4 of
+        # 5 factual tasks (organizer-17-f7r run). The digit guard keeps the
+        # known math->factual misroute (multi-number word problems) from
+        # being regenerated against irrelevant encyclopedia chunks.
         try:
             from agent import wikirag
-            chunks = wikirag.lookup(prompt, reply or "")
+            chunks = wikirag.lookup(prompt, reply or "")[:3]
         except Exception:
             chunks = []
         if chunks:
-            ref = "\n\n".join("[%s] %s" % (t, b[:700]) for t, b in chunks)
+            ref = "\n\n".join("[%s] %s" % (t, b[:450]) for t, b in chunks)
             grounded = local.chat(
                 "Use the reference text to answer. If it does not contain "
                 "the answer, answer from your own knowledge.\n\nReference:\n"
                 + ref + "\n\nQuestion: " + prompt + "\n\n"
                 + spec["suffix"].strip(),
-                max_tokens=max(spec["max_tokens"], 96),
+                max_tokens=80,
                 deadline=local_deadline)
             if grounded and grounded.strip():
                 _log("[local-rag] factual grounded answer shipped")

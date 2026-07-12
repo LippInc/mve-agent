@@ -1614,7 +1614,7 @@ def _try_local_sum_structured(local, prompt: str, deadline,
                            "summary. Include the most important numbers "
                            "and names from the passage.",
                            max_tokens=96, deadline=local_deadline)
-        if draft and _sentence_count(draft) == 1:
+        if draft and _sentence_count(draft) == 1 and len(draft.split()) >= 5:
             if (not _sum_rich(prompt, draft)
                     and local_deadline - time.monotonic() > 4.0):
                 missing = _missing_anchors(prompt, draft)
@@ -1646,8 +1646,14 @@ def _try_local_sum_structured(local, prompt: str, deadline,
             redo = local.chat("Rewrite this as exactly ONE sentence. Output "
                               f"only the sentence.\n\n{draft}",
                               max_tokens=96, deadline=local_deadline)
-            if redo and _sentence_count(redo) == 1:
+            if redo and _sentence_count(redo) == 1 \
+                    and len(redo.split()) >= 5:
                 return _sum_ship(prompt, redo, hybrid, "one-sentence rewrite")
+        # stub or no valid rewrite: deterministic one-sentence extractive
+        ext = _extractive_summary(prompt)
+        if ext and _sentence_count(ext) == 1:
+            _log("[local-sum] one-sentence fallback -> extractive")
+            return _sum_ship(prompt, ext, hybrid, "one-sentence extractive")
         return None
     mb = _BULLET_ASK_RX.search(instr)
     if mb:
@@ -1809,8 +1815,17 @@ def _try_local_sum(local, prompt: str, deadline, hybrid: bool = False) -> str:
             f"Shorten this to at most {target} words, keeping the meaning and "
             f"format. Output only the result.\n\n{draft}",
             max_tokens=112, deadline=local_deadline)
-        if shorter and localgate.word_count(shorter) <= limit:
+        if shorter and localgate.word_count(shorter) <= limit \
+                and len(shorter.split()) >= 5 \
+                and _sum_content_ok(prompt, shorter):
             return _sum_ship(prompt, shorter, hybrid, "compressed within-limit")
+        # A deadline-starved shortener returns a word-stub ('Riv') that
+        # passes the <=limit check (fresh-124 v3.4 subset shipped 3 chars).
+        # The extractive summary is the deterministic net.
+        ext = _extractive_summary(prompt)
+        if ext and localgate.word_count(ext) <= limit:
+            _log("[local-sum] bad compression -> extractive")
+            return _sum_ship(prompt, ext, hybrid, "extractive after compress")
     _log("[local-sum] over limit -> remote")
     return None
 

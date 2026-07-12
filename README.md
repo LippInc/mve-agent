@@ -25,6 +25,12 @@ pass deterministic verification before shipping.
   puzzles are brute-forced by generated constraint-enumeration programs.
   unverifiable answers fall back to the best available sample — never an
   empty answer.
+- **offline factual grounding**: factual questions retrieve passages from a
+  bundled Simple English Wikipedia full-text index (sqlite FTS5/BM25, built
+  at image-build time). the model drafts, the draft's entities steer the
+  lookup, and a grounded second pass answers from the retrieved text —
+  reading comprehension instead of small-model recall. still zero network:
+  the encyclopedia ships inside the image.
 - **escalation policy (hybrid builds only)**: the same codebase also builds
   a verified-local hybrid (`HYBRID_POLICY=h3`) where factual recall and
   failed verifications escalate as terse calls through `FIREWORKS_BASE_URL`
@@ -42,7 +48,7 @@ zero-token local build; earlier submissions from this repo were the hybrid.
 ## docker image
 
 ```
-ghcr.io/lippinc/mve-agent:final5
+ghcr.io/lippinc/mve-agent:final6
 ```
 
 ## how it runs
@@ -54,7 +60,7 @@ docker run --rm \
   -e FIREWORKS_API_KEY=... \
   -e FIREWORKS_BASE_URL=... \
   -e ALLOWED_MODELS=... \
-  ghcr.io/lippinc/mve-agent:final5
+  ghcr.io/lippinc/mve-agent:final6
 ```
 
 all configuration comes from the environment. no keys or answers are baked
@@ -67,6 +73,9 @@ into the image.
 - [Qwen2.5-Coder-1.5B-Instruct](https://huggingface.co/Qwen/Qwen2.5-Coder-1.5B-Instruct)
   (Q4_K_M GGUF) — Apache License 2.0
 - [llama.cpp](https://github.com/ggml-org/llama.cpp) `llama-server` — MIT License
+- Simple English Wikipedia article text (snapshot 2023-11-01, via the
+  [wikimedia/wikipedia](https://huggingface.co/datasets/wikimedia/wikipedia)
+  dataset), indexed offline — CC-BY-SA 3.0
 
 ## submission items
 

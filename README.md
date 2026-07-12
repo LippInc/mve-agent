@@ -3,11 +3,11 @@
 solo entry for the AMD Developer Hackathon: ACT II, track 1 (general-purpose AI agent).
 
 a small agent. it reads `/input/tasks.json`, answers each task, and writes
-`/output/results.json`. the current build is a **verified-local hybrid**:
-prompts are routed by category and answered first by bundled llama.cpp
-models; a local answer ships only after passing a deterministic check, and
-tasks that can't be verified locally escalate as terse calls through
-`FIREWORKS_BASE_URL` to a model from `ALLOWED_MODELS`.
+`/output/results.json`. the submitted build is the **pure local
+configuration**: every task is answered by bundled llama.cpp models running
+inside the container — **zero network calls, zero API tokens** (validated
+with `--network none`). prompts are routed by category, drafted locally, and
+pass deterministic verification before shipping.
 
 ## how it works
 
@@ -25,25 +25,24 @@ tasks that can't be verified locally escalate as terse calls through
   puzzles are brute-forced by generated constraint-enumeration programs.
   unverifiable answers fall back to the best available sample — never an
   empty answer.
-- **escalation policy** (`HYBRID_POLICY=h3`): factual recall always goes
-  remote (small local models hallucinate on open-domain facts); code, math,
-  NER, sentiment and summaries ship locally only when their verification
-  passes; summaries below a content floor re-draft remotely; logic
-  escalations run the remote model with thinking enabled. escalated calls
-  stay terse — capped completions, no system-prompt mass.
+- **escalation policy (hybrid builds only)**: the same codebase also builds
+  a verified-local hybrid (`HYBRID_POLICY=h3`) where factual recall and
+  failed verifications escalate as terse calls through `FIREWORKS_BASE_URL`
+  to a model from `ALLOWED_MODELS`. in the submitted zero-token build nothing
+  escalates — every category resolves locally, with best-available fallbacks
+  instead of remote calls.
 - **budget discipline**: a global watchdog fair-shares the runtime budget so
   the batch always completes inside the contest limits, and `results.json`
   is written atomically after every task (always valid JSON, exit 0).
 
-the same codebase also builds a pure zero-token configuration (local
-inference only — **no network calls at all**, validated with
-`--network none`) selected at build time via `LOCAL_LAYER` / `LOCAL_ONLY`
-build args. the submitted image is the hybrid build.
+configurations are selected at build time via `LOCAL_LAYER` / `LOCAL_ONLY` /
+`HYBRID_POLICY` / `LOCAL_FINAL` build args. the submitted image is the pure
+zero-token local build; earlier submissions from this repo were the hybrid.
 
 ## docker image
 
 ```
-ghcr.io/lippinc/mve-agent:final4
+ghcr.io/lippinc/mve-agent:final5
 ```
 
 ## how it runs
@@ -55,7 +54,7 @@ docker run --rm \
   -e FIREWORKS_API_KEY=... \
   -e FIREWORKS_BASE_URL=... \
   -e ALLOWED_MODELS=... \
-  ghcr.io/lippinc/mve-agent:final4
+  ghcr.io/lippinc/mve-agent:final5
 ```
 
 all configuration comes from the environment. no keys or answers are baked

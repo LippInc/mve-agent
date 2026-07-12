@@ -2105,6 +2105,14 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
                 if short and short.strip():
                     _log(f"[local-raw] {category} truncated trace -> re-ask")
                     reply = short.strip()
+                else:
+                    cut = max(r.rfind("."), r.rfind("!"), r.rfind("?"))
+                    if cut >= 40:
+                        reply = r[: cut + 1]
+            else:
+                cut = max(r.rfind("."), r.rfind("!"), r.rfind("?"))
+                if cut >= 40:
+                    reply = r[: cut + 1]
     if reply and category == "summarization":
         # A deadline-aborted stream lands here as a mid-sentence fragment
         # (v3 full-124: two raw fragments, both at the 28 s cap — one a

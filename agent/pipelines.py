@@ -1536,6 +1536,58 @@ def _sum_content_ok(prompt: str, draft: str) -> bool:
     return any(a in d for a in anchors)
 
 
+def _sum_final_repair(prompt: str, text: str, per_cap=None) -> str:
+    """Deadline-cut generations ship with the FINAL unit sliced mid-thought
+    while every count gate still passes — the cut lands inside the last
+    bullet/sentence (v3.5 sum run: 7 of 20 answers ended 'launches October
+    to' / 'closed two downtown'). Repair: a broken final bullet is replaced
+    with an unused source sentence; a broken single block is cut back to
+    its last complete sentence or closed."""
+    if not text:
+        return text
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    if len(lines) > 1:
+        last = lines[-1].rstrip()
+        if last and last[-1] not in ".!?\"'":
+            m = _BULLET_LINE_RX.match(last)
+            marker = m.group(0) if m else "- "
+            used_words = set(re.findall(
+                r"[a-z0-9$%]+", " ".join(lines[:-1]).casefold()))
+            try:
+                passage = _extract_passage(prompt)
+                for s in _SENT_SPLIT_RX.split(passage):
+                    s = s.strip()
+                    sw = set(re.findall(r"[a-z0-9$%]+", s.casefold()))
+                    if len(s.split()) >= 6 and sw \
+                            and len(sw & used_words) / len(sw) <= 0.6:
+                        cap = per_cap or 28
+                        ws = s.split()
+                        if len(ws) > cap:
+                            ws = ws[:cap]
+                            while len(ws) > 3 \
+                                    and _clean_tail(ws[-1]) in _DANGLING:
+                                ws.pop()
+                            s = " ".join(ws).rstrip(",;:")
+                        lines[-1] = marker + s.rstrip(".!?") + "."
+                        _log("[sum-repair] broken final bullet replaced")
+                        return "\n".join(lines)
+            except Exception:
+                pass
+            lines[-1] = last.rstrip(",;:") + "."
+            _log("[sum-repair] broken final bullet closed")
+            return "\n".join(lines)
+        return text
+    r = text.rstrip()
+    if r and r[-1] not in ".!?\"'":
+        cut = max(r.rfind("."), r.rfind("!"), r.rfind("?"))
+        if cut >= 40:
+            _log("[sum-repair] trailing fragment cut")
+            return r[: cut + 1]
+        _log("[sum-repair] fragment closed")
+        return r.rstrip(",;:") + "."
+    return text
+
+
 def _missing_anchors(prompt: str, draft: str) -> list:
     """Distinctive source tokens (numerics first, then proper nouns) absent
     from the draft — used to name the exact gaps in a directed retry."""
@@ -1588,7 +1640,19 @@ def _fix_trailing_fragment(text: str) -> str:
 def _sum_ship(prompt: str, draft: str, hybrid: bool, what: str) -> str:
     """Central summarization ship gate: hollow drafts escalate in hybrid mode
     (remote rescue exists), ship as-is otherwise (LOCAL_ONLY/legacy — an
-    on-format local summary beats nothing)."""
+    on-format local summary beats nothing). Every path funnels here, so the
+    final-unit truncation repair lives here too."""
+    try:
+        head = prompt[:260]
+        if ":" in head:
+            head = head.split(":", 1)[0]
+        instr = head + "\n" + prompt[-120:]
+        mcap = _WORD_LIMIT_RX.search(instr)
+        per_cap = (_word_limit(mcap)
+                   if mcap and _PER_ITEM_RX.search(instr) else None)
+        draft = _sum_final_repair(prompt, draft, per_cap)
+    except Exception:
+        pass
     if _sum_content_ok(prompt, draft):
         _log(f"[local-sum] {what} verified - shipped local")
         return draft

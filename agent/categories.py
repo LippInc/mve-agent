@@ -48,11 +48,20 @@ _SUMMAR_RX = re.compile(
     r"[\s\S]{0,60}?\binto (exactly )?(one|two|three|four|five|\d+) sentences?\b")
 _NER_RX = re.compile(
     r"\bentit(y|ies)\b|named entit"
-    r"|\b(extract|identify|list|find|pull out|name)\b[\s\S]{0,80}?"
+    r"|\b(extract|identify|list|find|pull out|name|tag)\b[\s\S]{0,80}?"
     r"\b(people|persons?|organi[sz]ations?|locations?|dates?|monetary|names"
     r"|compan(y|ies)|firms?|cities|countries|brands?|products?"
-    r"|nationalit(y|ies)|places)\b"
-    r"|who and what (is|are) mentioned")
+    r"|nationalit(y|ies)|places|proper nouns?)\b"
+    r"|who and what (is|are) mentioned"
+    # question-phrased NER asks ("Which people ... are mentioned/named in
+    # the text?") missed the verb branch and fell through to factual, which
+    # has zero entity shape-checking (fresh-124 nv2-ner-L2-1 shipped a
+    # hallucinated set through exactly this hole)
+    r"|\b(which|what|who)\b[\s\S]{0,60}?\b(people|persons?"
+    r"|organi[sz]ations?|locations?|compan(y|ies)|places)\b[\s\S]{0,60}?"
+    r"\b(mentioned|named|referenced|appear)")
+_SCIENCE_FACT_RX = re.compile(
+    r"chemical symbol|atomic number|periodic table")
 # Counting questions ("find the number of people who...") want a number, not
 # an entity list — they must not trip the NER verb-branch.
 _COUNT_Q_RX = re.compile(r"\bhow many\b|\bnumber of\b|\bcount of\b")
@@ -169,6 +178,11 @@ def detect(prompt: str) -> str:
     # entities...") — that wants a number.
     if "named entit" in p and not _COUNT_Q_RX.search(p):
         return "ner"
+    # Science-fact short-circuit BEFORE math: "chemical symbol for iron,
+    # plus its atomic number" trips _MATH_KW_RX's bare \bplus\b and ships
+    # arithmetic nonsense (fresh-124 nv2-factual-L1-2, twice live).
+    if _SCIENCE_FACT_RX.search(p):
+        return "factual"
     if _SENTIMENT_RX.search(p):
         return "sentiment"
     if _SUMMAR_RX.search(p):

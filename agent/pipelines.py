@@ -877,6 +877,16 @@ def _ner_apply_constraints(prompt: str, pairs: list, base_keys: set) -> list:
     """Honor the prompt's explicit output constraints — an extra entity
     against an 'exactly four items' or 'ignore dates' instruction is a
     judge-visible violation (fresh-124: 2 strict fails)."""
+    # dedupe first: a duplicate line must never push a real entity out of
+    # an exactly-N trim (hunt finding #10)
+    seen = set()
+    deduped = []
+    for e, t in pairs:
+        k = (e.casefold().strip(), t)
+        if k not in seen:
+            seen.add(k)
+            deduped.append((e, t))
+    pairs = deduped
     excl = set()
     for m in _NER_EXCLUDE_RX.finditer(prompt):
         w = m.group(1).lower()
@@ -1023,8 +1033,10 @@ def _logic_directed_recheck(local, prompt: str, ans: str, deadline) -> str:
             + ". Reply with only the final answer, no reasoning.",
             max_tokens=56,
             deadline=min(deadline, time.monotonic() + 10.0))
+        # replace only when the re-ask covers EVERY asked name (not just the
+        # missing ones) — a partial re-ask must never displace the original
         if r and r.strip() \
-                and all(n.casefold() in r.casefold() for n in missing):
+                and all(n.casefold() in r.casefold() for n in names):
             _log("[local-logic] directed recheck completed the answer")
             return r.strip()
     except Exception:
@@ -1144,7 +1156,7 @@ def _reground_directions(local, prompt, spec_text, deadline) -> str:
             if deadline - time.monotonic() > 3.0:
                 r = local.chat(prompt + _IMM_YESNO.format(a=a, b=b),
                                max_tokens=4, deadline=deadline)
-                if r and r.strip().lower().startswith("no"):
+                if r and re.match(r"no\b", r.strip().lower()):
                     a, b = b, a
             out.append(f"C immbefore {a} {b}")
         else:
@@ -1577,7 +1589,10 @@ def _sum_final_repair(prompt: str, text: str, per_cap=None) -> str:
     if not text:
         return text
     lines = [ln for ln in text.splitlines() if ln.strip()]
-    if len(lines) > 1:
+    if len(lines) > 1 and _BULLET_LINE_RX.match(lines[-1]):
+        # bullet-replacement ONLY for actual bullet/numbered lists — a
+        # 2-line headline+sentence combo must not get a dashed source
+        # sentence grafted on (hunt finding #13)
         last = lines[-1].rstrip()
         if last and last[-1] not in ".!?\"'":
             m = _BULLET_LINE_RX.match(last)
@@ -2079,12 +2094,18 @@ def _local_raw(local, category: str, prompt: str, deadline, spec) -> str:
     if reply and category == "factual":
         # A cap-truncated tail ("...the Hudson Riv") reads as broken to the
         # judge — trim to the last complete sentence when one exists. Only
-        # factual: NER/summaries are not sentence-shaped.
+        # factual: NER/summaries are not sentence-shaped. A fragment with NO
+        # complete sentence ("The Eiffel Tower is") must NOT ship verbatim —
+        # empty falls to the caller's grace retry instead (hunt-verified:
+        # the stream-abort tail bypassed the retry entirely).
         r = reply.rstrip()
         if r and r[-1] not in ".!?":
             cut = max(r.rfind("."), r.rfind("!"), r.rfind("?"))
             if cut >= 40:
                 reply = r[: cut + 1]
+            elif len(r) < 60:
+                _log("[local-raw] factual fragment dropped -> grace retry")
+                reply = ""
     if reply and category in ("math", "logic"):
         # A deadline-truncated reasoning trace never states the answer
         # (fresh-124 L3-5: '1. Start at origin (' shipped verbatim). Try the

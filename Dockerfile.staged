@@ -51,7 +51,7 @@ COPY vendor/wiki/ /models/wiki/
 
 COPY agent/ ./agent/
 
-ARG LOCAL_FLAGS="code+,math,sentiment,ner"
+ARG LOCAL_FLAGS="code+,math,sentiment,ner,sum,logic,factual"
 # Set LOCAL_ONLY_MODE=1 to build the zero-proxy-token variant (never calls
 # the remote API; accuracy rides entirely on the bundled models).
 ARG LOCAL_ONLY_MODE=""

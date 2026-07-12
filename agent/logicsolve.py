@@ -274,7 +274,9 @@ def _project(spec, sols):
             answers.add(", ".join(
                 f"{e.capitalize()}: {sol[e]}" for e in sorted(sol)))
         elif qk == "roles":
-            parts = [f"{e.capitalize()} is a {sol[e]}" for e in sol]
+            # sorted: two translations listing ITEMS in different orders
+            # must not make the agreement gate decline a correct answer
+            parts = [f"{e.capitalize()} is a {sol[e]}" for e in sorted(sol)]
             if len(parts) > 1:
                 parts[-1] = "and " + parts[-1]
             answers.add(", ".join(parts) + ".")
@@ -328,4 +330,4 @@ def solve(text: str):
 
 # quick shape trigger for the pipeline (heads-and-legs misroutes to math)
 INTSYSTEM_RX = re.compile(r"\bheads\b.{0,200}\b(legs|wheels)\b", re.I | re.S)
-KNIGHTS_RX = re.compile(r"knights? always tell the truth", re.I)
+KNIGHTS_RX = re.compile(r"knights? always tells? the truth", re.I)

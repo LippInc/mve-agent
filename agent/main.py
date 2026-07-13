@@ -228,7 +228,8 @@ def main() -> int:
             ans = pipelines.answer_task(client, current, t["prompt"], now + budget,
                                         local=local, category=t.get("category"),
                                         local_only=settings.local_only,
-                                        hybrid_policy=settings.hybrid_policy)
+                                        hybrid_policy=settings.hybrid_policy,
+                                        emergency_remote=settings.emergency_remote)
             if ans:
                 answers[t["task_id"]] = str(ans)
         except Exception as e:  # per-task isolation: one bad task never kills the run

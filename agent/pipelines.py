@@ -2346,6 +2346,68 @@ def _last_resort(local, category: str, prompt: str, spec) -> str:
     return ""
 
 
+# ---------------- v9: emergency remote rescue (EMERGENCY_REMOTE=1) ---------
+# The 0-token lane's one proven live killer is a too-slow box: deadline-cut
+# fragments and empties that no local net can repair (live 12/19 and 9/19,
+# both root-caused to vCPU starvation). With EMERGENCY_REMOTE set, an answer
+# that still looks broken AFTER every local net has run may be replaced by
+# one terse remote call through the live-proven hybrid shapes (h3: 17/19
+# twice). A healthy box never fires the gate; the token score stays 0.
+
+def _rescue_worthy(category: str, ans: str) -> bool:
+    """True only for answer shapes that are near-certain judge fails.
+    Sentiment/NER/summarization keep their own validated deterministic nets —
+    for those only a fully EMPTY answer qualifies."""
+    a = (ans or "").strip()
+    if not a:
+        return True
+    if category == "math" and not re.search(r"\d", a):
+        # math answers virtually always carry a number; a numberless one is
+        # a cut derivation ("First we take the derivative and")
+        return True
+    if category in ("code-gen", "code-debug"):
+        code = ""
+        try:
+            code = codegate.extract_code(a)
+        except Exception:
+            return False
+        if not code.strip():
+            return False        # nothing to judge -> never rescue on a guess
+        import ast as _ast
+        try:
+            _ast.parse(code)
+            return False
+        except SyntaxError:
+            return True         # _ast_salvage found NO parseable prefix
+        except Exception:
+            return False
+    if category in ("math", "logic", "factual"):
+        # long text cut mid-token: survived every trim/extract/re-ask net
+        return len(a) > 80 and a[-1] not in ".!?)\"'"
+    return False
+
+
+def _remote_rescue(client, ladder, category: str, prompt: str, deadline,
+                   spec) -> str:
+    """One bounded remote attempt through the proven hybrid shapes. The
+    sub-deadline keeps the request comfortably under the 30 s/request rule."""
+    rescue_deadline = min(deadline, time.monotonic() + 20.0)
+    try:
+        if category == "math":
+            return _math_task(client, ladder, prompt, rescue_deadline)
+        if category == "logic" and rescue_deadline - time.monotonic() > 12.0:
+            # terse logic measured 0/6 on fresh puzzles vs thinking 6/6 —
+            # a broken local logic answer is already a lost point, so buy
+            # the shape that actually works
+            return _logic_think_task(client, ladder, prompt, rescue_deadline)
+        if category == "summarization":
+            return _summarization_task(client, ladder, prompt, rescue_deadline, spec)
+        return _call(client, ladder, prompt + spec["suffix"], rescue_deadline,
+                     spec["max_tokens"])
+    except Exception:
+        return ""
+
+
 # >=3 segments of >=3 chars each: 'KaiLiorJaeIda' splits, 'McDonald'/'JoAnne'
 # (single names with internal caps) stay untouched.
 _SMASHED_NAMES_RX = re.compile(r"^[A-Z][a-z]{2,}(?:[A-Z][a-z]{2,}){2,7}$")
@@ -2363,7 +2425,7 @@ def _unsmash_names(ans: str) -> str:
 
 def answer_task(client, ladder, prompt: str, deadline, local=None,
                 category: str = None, local_only: bool = False,
-                hybrid_policy: str = "") -> str:
+                hybrid_policy: str = "", emergency_remote: bool = False) -> str:
     """Route, shape, verify. Returns the answer text or "" when nothing
     succeeded (caller applies the static fallback)."""
     if category is None:
@@ -2384,10 +2446,24 @@ def answer_task(client, ladder, prompt: str, deadline, local=None,
         return ans  # verified locally -> zero proxy tokens
 
     if local_only:
-        # NEVER call remote in this mode - the token score must stay 0.
-        ans = _local_raw(local, category, prompt, deadline, spec)
+        # No remote on the primary path - the token score must stay 0. With
+        # EMERGENCY_REMOTE armed, reserve a small window so the rescue gate
+        # below still has room after a deadline-eating raw attempt.
+        rescue_armed = bool(emergency_remote and client is not None and ladder)
+        raw_deadline = deadline - 8.0 if rescue_armed else deadline
+        ans = _local_raw(local, category, prompt, raw_deadline, spec)
         if not ans or not ans.strip():
             ans = _last_resort(local, category, prompt, spec)
+        if (rescue_armed and _rescue_worthy(category, ans)
+                and deadline - time.monotonic() > 4.0):
+            # this answer is a near-certain judge fail — trade a handful of
+            # proxy tokens for the point (gate stays cold on a healthy box)
+            r = _remote_rescue(client, ladder, category, prompt, deadline, spec)
+            if r and r.strip() and not _rescue_worthy(category, r):
+                _log(f"[rescue] {category} emergency remote answer shipped")
+                ans = r.strip()
+            else:
+                _log(f"[rescue] {category} remote unavailable - kept local")
         return _unsmash_names(ans) if category == "logic" and ans else ans
 
     if category in _LOCAL_FINAL:

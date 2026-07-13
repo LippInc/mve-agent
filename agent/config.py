@@ -120,6 +120,14 @@ class Settings:
         # models, so this only ever ships when the bench says the local stack
         # clears the gate with margin.
         self.local_only = env.get("LOCAL_ONLY", "").strip().lower() in ("1", "true", "yes")
+        # EMERGENCY_REMOTE=1 (only meaningful with LOCAL_ONLY): identical
+        # zero-token behavior, EXCEPT a task whose final local answer still
+        # looks like a guaranteed judge fail (empty / numberless math /
+        # mid-sentence fragment / unparseable code) may spend ONE terse remote
+        # call to replace it. Insurance against the slow-box failure mode
+        # (live 12/19 and 9/19, both vCPU starvation); on a healthy box the
+        # gate never fires and the token score stays exactly 0.
+        self.emergency_remote = env.get("EMERGENCY_REMOTE", "").strip().lower() in ("1", "true", "yes")
         # HYBRID_POLICY (Basket B, ignored when LOCAL_ONLY): "" = legacy
         # hybrid; "h1" = insured-local (factual always-remote, logic ships
         # only on agreement); "h2" = h1 but logic also ships its best single

@@ -52,7 +52,7 @@ zero-token local build; earlier submissions from this repo were the hybrid.
 ## docker image
 
 ```
-ghcr.io/lippinc/mve-agent:final7
+ghcr.io/lippinc/mve-agent:final10
 ```
 
 ## how it runs
@@ -64,7 +64,7 @@ docker run --rm \
   -e FIREWORKS_API_KEY=... \
   -e FIREWORKS_BASE_URL=... \
   -e ALLOWED_MODELS=... \
-  ghcr.io/lippinc/mve-agent:final7
+  ghcr.io/lippinc/mve-agent:final10
 ```
 
 all configuration comes from the environment. no keys or answers are baked
